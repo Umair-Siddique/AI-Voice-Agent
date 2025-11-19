@@ -46,9 +46,17 @@ def handle_incoming_call():
         "O.K. you can start talking!",
         voice="Google.en-US-Chirp3-HD-Aoede"
     )
-    host = request.host
+    # Get the host - Render provides RENDER_EXTERNAL_URL, fallback to request.host
+    render_url = os.getenv('RENDER_EXTERNAL_URL')
+    if render_url:
+        # Extract hostname from full URL (e.g., https://app.onrender.com -> app.onrender.com)
+        host = render_url.replace('https://', '').replace('http://', '').rstrip('/')
+    else:
+        host = request.host
+    # Ensure wss:// protocol for WebSocket
+    ws_url = f'wss://{host}/voice/media-stream'
     connect = Connect()
-    connect.stream(url=f'wss://{host}/voice/media-stream')
+    connect.stream(url=ws_url)
     response.append(connect)
     return Response(str(response), mimetype="application/xml")
 

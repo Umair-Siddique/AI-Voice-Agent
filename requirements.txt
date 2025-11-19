@@ -5,3 +5,4 @@ flask_cors
 websockets
 flask-sock
 twilio
+gunicorn
