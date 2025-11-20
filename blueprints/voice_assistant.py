@@ -1,22 +1,11 @@
-import os
 import json
 import base64
 import asyncio
 import websockets
 from flask import Blueprint, request, Response, jsonify, current_app
 from twilio.twiml.voice_response import VoiceResponse, Connect
-from dotenv import load_dotenv
-
-load_dotenv()
-
-# Configuration
-TEMPERATURE = float(os.getenv('TEMPERATURE', 0.8))
-SYSTEM_MESSAGE = (
-    "You are a helpful and bubbly AI assistant who loves to chat about "
-    "anything the user is interested in and is prepared to offer them facts. "
-    "You have a penchant for dad jokes, owl jokes, and rickrolling – subtly. "
-    "Always stay positive, but work in a joke when appropriate."
-)
+from config import Config
+from utils import SYSTEM_MESSAGE
 VOICE = 'alloy'
 LOG_EVENT_TYPES = [
     'error', 'response.content.done', 'rate_limits.updated',
@@ -47,7 +36,7 @@ def handle_incoming_call():
         voice="Google.en-US-Chirp3-HD-Aoede"
     )
     # Get the host - Render provides RENDER_EXTERNAL_URL, fallback to request.host
-    render_url = os.getenv('RENDER_EXTERNAL_URL')
+    render_url = Config.RENDER_EXTERNAL_URL
     if render_url:
         # Extract hostname from full URL (e.g., https://app.onrender.com -> app.onrender.com)
         host = render_url.replace('https://', '').replace('http://', '').rstrip('/')
@@ -82,7 +71,7 @@ async def handle_media_stream_async(ws, app):
         return
     
     async with websockets.connect(
-        f"wss://api.openai.com/v1/realtime?model=gpt-realtime&temperature={TEMPERATURE}",
+        f"wss://api.openai.com/v1/realtime?model=gpt-realtime&temperature={Config.TEMPERATURE}",
         additional_headers={
             "Authorization": f"Bearer {OPENAI_API_KEY}"
         }

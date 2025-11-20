@@ -1,22 +1,10 @@
-import os
 from flask import Blueprint, request, current_app, Response, jsonify
 from twilio.rest import Client
-from dotenv import load_dotenv
-
-load_dotenv()
-
-# Configuration
-SYSTEM_MESSAGE = (
-    "You are a Conssultant in Legal Domain with name Aima."
-    "Answer to user questio carefully."
-)
+from config import Config
+from utils import SYSTEM_MESSAGE
 
 # Initialize Twilio client
-TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID')
-TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
-TWILIO_WHATSAPP_NUMBER = 'whatsapp:+14155238886'  # Twilio WhatsApp trial number
-
-twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+twilio_client = Client(Config.TWILIO_ACCOUNT_SID, Config.TWILIO_AUTH_TOKEN)
 
 whatsapp_assistant_bp = Blueprint('whatsapp_assistant', __name__)
 
@@ -82,7 +70,7 @@ def handle_incoming_whatsapp():
         # Note: from_number already includes 'whatsapp:' prefix from Twilio
         message = twilio_client.messages.create(
             body=ai_message,
-            from_=TWILIO_WHATSAPP_NUMBER,
+            from_=Config.TWILIO_WHATSAPP_NUMBER,
             to=from_number  # from_number already has 'whatsapp:' prefix
         )
         
@@ -101,7 +89,7 @@ def handle_incoming_whatsapp():
         try:
             error_message = twilio_client.messages.create(
                 body="Sorry, I'm having trouble processing your message right now. Please try again later.",
-                from_=TWILIO_WHATSAPP_NUMBER,
+                from_=Config.TWILIO_WHATSAPP_NUMBER,
                 to=from_number
             )
             print(f"Error message sent. SID: {error_message.sid}")
@@ -145,7 +133,7 @@ def test_whatsapp():
         # Send simple test message using Twilio SDK
         message = twilio_client.messages.create(
             body="Hello! This is a test response from your AI WhatsApp assistant.",
-            from_=TWILIO_WHATSAPP_NUMBER,
+            from_=Config.TWILIO_WHATSAPP_NUMBER,
             to=from_number
         )
         

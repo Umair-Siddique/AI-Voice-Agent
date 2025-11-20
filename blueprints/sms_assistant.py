@@ -1,25 +1,10 @@
-import os
 from flask import Blueprint, request, current_app, Response, jsonify
 from twilio.rest import Client
-from dotenv import load_dotenv
-
-load_dotenv()
-
-# Configuration
-SYSTEM_MESSAGE = (
-    "You are a helpful and bubbly AI assistant who loves to chat about "
-    "anything the user is interested in and is prepared to offer them facts. "
-    "You have a penchant for dad jokes, owl jokes, and rickrolling – subtly. "
-    "Always stay positive, but work in a joke when appropriate. "
-    "Keep your responses concise and friendly since this is SMS."
-)
+from config import Config
+from utils import SYSTEM_MESSAGE
 
 # Initialize Twilio client
-TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID')
-TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
-TWILIO_PHONE_NUMBER = os.getenv('TWILIO_PHONE_NUMBER')
-
-twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+twilio_client = Client(Config.TWILIO_ACCOUNT_SID, Config.TWILIO_AUTH_TOKEN)
 
 sms_assistant_bp = Blueprint('sms_assistant', __name__)
 
@@ -86,7 +71,7 @@ def handle_incoming_sms():
         # Send SMS using Twilio SDK
         message = twilio_client.messages.create(
             body=ai_message,
-            from_=TWILIO_PHONE_NUMBER,
+            from_=Config.TWILIO_PHONE_NUMBER,
             to=from_number
         )
         
@@ -105,7 +90,7 @@ def handle_incoming_sms():
         try:
             error_message = twilio_client.messages.create(
                 body="Sorry, I'm having trouble processing your message right now. Please try again later.",
-                from_=TWILIO_PHONE_NUMBER,
+                from_=Config.TWILIO_PHONE_NUMBER,
                 to=from_number
             )
             print(f"Error message sent. SID: {error_message.sid}")
@@ -145,7 +130,7 @@ def test_sms():
         # Send simple test message using Twilio SDK
         message = twilio_client.messages.create(
             body="Hello! This is a test response from your AI assistant.",
-            from_=TWILIO_PHONE_NUMBER,
+            from_=Config.TWILIO_PHONE_NUMBER,
             to=from_number
         )
         
