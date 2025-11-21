@@ -1,6 +1,7 @@
 import json
 import base64
 import asyncio
+import threading
 import websockets
 from websockets.exceptions import ConnectionClosed
 from flask import Blueprint, request, Response, jsonify, current_app
@@ -58,30 +59,39 @@ def register_websocket_routes(sock, app):
         """Handle WebSocket connections between Twilio and OpenAI."""
         print("Client connected")
         
-        # Get or create event loop for this thread
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
+        # Create a new event loop in a separate thread for asyncio operations
+        # This avoids conflicts with gevent's event loop
+        loop = None
+        thread = None
+        
+        def run_async_handler():
+            nonlocal loop
+            # Create a new event loop for this thread
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-        
-        # Run the async handler
-        try:
-            loop.run_until_complete(handle_media_stream_async(ws, app))
-        except Exception as e:
-            print(f"Error in handle_media_stream: {e}")
-            import traceback
-            traceback.print_exc()
-        finally:
-            # Clean up if needed
             try:
-                pending = asyncio.all_tasks(loop)
-                for task in pending:
-                    task.cancel()
-                if pending:
-                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                loop.run_until_complete(handle_media_stream_async(ws, app))
             except Exception as e:
-                print(f"Error during cleanup: {e}")
+                print(f"Error in handle_media_stream: {e}")
+                import traceback
+                traceback.print_exc()
+            finally:
+                # Clean up
+                try:
+                    if loop:
+                        pending = asyncio.all_tasks(loop)
+                        for task in pending:
+                            task.cancel()
+                        if pending:
+                            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                        loop.close()
+                except Exception as e:
+                    print(f"Error during cleanup: {e}")
+        
+        # Run the async handler in a separate thread
+        thread = threading.Thread(target=run_async_handler, daemon=False)
+        thread.start()
+        thread.join()  # Wait for the connection to complete
 
 async def handle_media_stream_async(ws, app):
     """Async handler for WebSocket connections between Twilio and OpenAI."""
