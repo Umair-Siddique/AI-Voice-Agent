@@ -7,3 +7,4 @@ flask-sock
 twilio
 gunicorn
 gevent
+fastmcp
