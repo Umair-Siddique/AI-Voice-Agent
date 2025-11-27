@@ -8,3 +8,4 @@ twilio
 gunicorn
 gevent
 fastmcp
+audioop-lts

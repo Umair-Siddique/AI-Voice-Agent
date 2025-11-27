@@ -4,7 +4,10 @@ import asyncio
 import threading
 import io
 import wave
-import audioop
+try:
+    import audioop
+except ModuleNotFoundError:  # Python 3.13 removed audioop
+    import audioop_lts as audioop
 import uuid
 from typing import Any, Dict, List, Optional
 
