@@ -2,12 +2,16 @@ import json
 import base64
 import asyncio
 import threading
+from typing import Any, Dict
+
 import websockets
 from websockets.exceptions import ConnectionClosed
-from flask import Blueprint, request, Response, jsonify, current_app
+from flask import Blueprint, request, Response, jsonify
 from twilio.twiml.voice_response import VoiceResponse, Connect
+
 from config import Config
 from utils import SYSTEM_MESSAGE
+from blueprints import mcp_server
 VOICE = 'alloy'
 LOG_EVENT_TYPES = [
     'error', 'response.content.done', 'rate_limits.updated',
@@ -18,6 +22,108 @@ LOG_EVENT_TYPES = [
 SHOW_TIMING_MATH = False
 
 voice_mcp_bp = Blueprint('voicemcp', __name__)
+
+
+class RealtimeToolCallHandler:
+    """Buffers tool call arguments from streaming events and executes MCP tools."""
+
+    def __init__(self, executor):
+        self.executor = executor
+        self.pending_calls: Dict[str, Dict[str, Any]] = {}
+
+    async def handle_event(self, event: Dict[str, Any], connection) -> bool:
+        """Process tool call events, returns True if handled."""
+        event_type = event.get("type")
+        if event_type == "response.output_tool_call.delta":
+            self._buffer_delta(event)
+            return True
+        if event_type == "response.output_tool_call.done":
+            await self._complete_call(event, connection)
+            return True
+        return False
+
+    def _buffer_delta(self, event: Dict[str, Any]) -> None:
+        call_id, name, args_chunk = self._extract_delta_details(event)
+        if not call_id:
+            print("⚠️  Tool delta missing call_id", event)
+            return
+        entry = self.pending_calls.setdefault(call_id, {"name": None, "arguments": ""})
+        if name:
+            entry["name"] = name
+        if args_chunk:
+            entry["arguments"] += args_chunk
+
+    async def _complete_call(self, event: Dict[str, Any], connection) -> None:
+        call_id, name, arguments = self._extract_completion_details(event)
+        if not call_id:
+            print("⚠️  Tool completion missing call_id", event)
+            return
+
+        entry = self.pending_calls.pop(call_id, {"name": None, "arguments": ""})
+        buffered_args = entry.get("arguments", "")
+        final_name = name or entry.get("name")
+        final_arguments = arguments or buffered_args
+        # If both contain data, prefer buffered content + completion tail
+        if buffered_args and arguments and buffered_args != arguments:
+            final_arguments = buffered_args + arguments
+
+        if not final_name:
+            result_text = "Tool call missing name; unable to execute."
+        else:
+            try:
+                parsed_args = json.loads(final_arguments) if final_arguments and final_arguments.strip() else {}
+            except json.JSONDecodeError as exc:
+                result_text = (
+                    f"Failed to parse arguments for tool '{final_name}': {exc}. "
+                    f"Raw payload: {final_arguments}"
+                )
+            else:
+                try:
+                    result_text = await self.executor(final_name, parsed_args)
+                    print(f"✅ MCP tool '{final_name}' succeeded")
+                except Exception as exc:
+                    result_text = f"Tool '{final_name}' raised an error: {exc}"
+
+        payload = {
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": result_text
+        }
+        await connection.send(json.dumps({
+            "type": "conversation.item.create",
+            "item": payload
+        }))
+        # Ask the model to continue now that the tool output is available
+        await connection.send(json.dumps({"type": "response.create"}))
+
+    @staticmethod
+    def _extract_delta_details(event: Dict[str, Any]):
+        delta = event.get("delta") or {}
+        call = delta.get("tool_call") or delta
+        function_block = call.get("function") or {}
+        call_id = (
+            call.get("id")
+            or call.get("call_id")
+            or delta.get("id")
+            or delta.get("call_id")
+            or event.get("call_id")
+        )
+        name = call.get("name") or function_block.get("name")
+        arguments = call.get("arguments") or function_block.get("arguments") or ""
+        return call_id, name, arguments
+
+    @staticmethod
+    def _extract_completion_details(event: Dict[str, Any]):
+        call = event.get("call") or event.get("tool_call") or {}
+        function_block = call.get("function") or {}
+        call_id = (
+            call.get("id")
+            or call.get("call_id")
+            or event.get("call_id")
+        )
+        name = call.get("name") or function_block.get("name")
+        arguments = call.get("arguments") or function_block.get("arguments") or ""
+        return call_id, name, arguments
 
 @voice_mcp_bp.route("/", methods=["GET"])
 def index_page():
@@ -111,6 +217,8 @@ async def handle_media_stream_async(ws, app):
     ) as openai_ws:
         await initialize_session(openai_ws)
 
+        tool_call_handler = RealtimeToolCallHandler(mcp_server._mcp_call)
+
         # Connection specific state
         stream_sid = None
         latest_media_timestamp = 0
@@ -175,6 +283,14 @@ async def handle_media_stream_async(ws, app):
                 async for openai_message in openai_ws:
                     try:
                         response = json.loads(openai_message)
+                        try:
+                            handled = await tool_call_handler.handle_event(response, openai_ws)
+                        except Exception as tool_exc:
+                            print(f"Error handling tool call event: {tool_exc}")
+                            handled = False
+                        if handled:
+                            continue
+
                         if response['type'] in LOG_EVENT_TYPES:
                             print(f"Received event: {response['type']}", response)
 
@@ -296,6 +412,12 @@ async def send_initial_conversation_item(openai_ws):
 
 async def initialize_session(openai_ws):
     """Control initial session with OpenAI."""
+    try:
+        tools_spec = mcp_server._build_mcp_tools_spec()
+    except Exception as exc:
+        print(f"⚠️  Failed to build MCP tool spec: {exc}")
+        tools_spec = []
+
     session_update = {
         "type": "session.update",
         "session": {
@@ -315,6 +437,8 @@ async def initialize_session(openai_ws):
             "instructions": SYSTEM_MESSAGE,
         }
     }
+    if tools_spec:
+        session_update["session"]["tools"] = tools_spec
     print('Sending session update:', json.dumps(session_update))
     await openai_ws.send(json.dumps(session_update))
 
