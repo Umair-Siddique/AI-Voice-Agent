@@ -54,7 +54,7 @@ def handle_incoming_call():
 def register_websocket_routes(sock, app):
     """Register WebSocket routes with the sock instance."""
     
-    @sock.route('/voicemcp/media-stream')
+    @sock.route('/voicemcp/media-stream', endpoint='voicemcp_media_stream')
     def handle_media_stream(ws):
         """Handle WebSocket connections between Twilio and OpenAI."""
         print("Client connected")
