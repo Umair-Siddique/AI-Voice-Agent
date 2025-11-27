@@ -30,6 +30,7 @@ class RealtimeToolCallHandler:
     def __init__(self, executor):
         self.executor = executor
         self.pending_calls: Dict[str, Dict[str, Any]] = {}
+        self._log_prefix = "🔧 Realtime MCP"
 
     async def handle_event(self, event: Dict[str, Any], connection) -> bool:
         """Process tool call events, returns True if handled."""
@@ -48,10 +49,14 @@ class RealtimeToolCallHandler:
             print("⚠️  Tool delta missing call_id", event)
             return
         entry = self.pending_calls.setdefault(call_id, {"name": None, "arguments": ""})
+        if entry["arguments"] == "":
+            print(f"{self._log_prefix}: received new tool call chunk (id={call_id})")
         if name:
             entry["name"] = name
+            print(f"{self._log_prefix}: tool '{name}' selected for call {call_id}")
         if args_chunk:
             entry["arguments"] += args_chunk
+            print(f"{self._log_prefix}: buffering args chunk ({len(args_chunk)} chars) for call {call_id}")
 
     async def _complete_call(self, event: Dict[str, Any], connection) -> None:
         call_id, name, arguments = self._extract_completion_details(event)
@@ -66,6 +71,9 @@ class RealtimeToolCallHandler:
         # If both contain data, prefer buffered content + completion tail
         if buffered_args and arguments and buffered_args != arguments:
             final_arguments = buffered_args + arguments
+        if final_name:
+            preview = final_arguments[:400] + ("..." if len(final_arguments) > 400 else "")
+            print(f"{self._log_prefix}: final payload ready for '{final_name}' (id={call_id}) -> {preview}")
 
         if not final_name:
             result_text = "Tool call missing name; unable to execute."
@@ -79,9 +87,12 @@ class RealtimeToolCallHandler:
                 )
             else:
                 try:
+                    print(f"{self._log_prefix}: executing '{final_name}' (id={call_id}) with args: {parsed_args}")
                     result_text = await self.executor(final_name, parsed_args)
-                    print(f"✅ MCP tool '{final_name}' succeeded")
+                    result_preview = result_text[:400] + ("..." if len(result_text) > 400 else "")
+                    print(f"{self._log_prefix}: tool '{final_name}' succeeded with output: {result_preview}")
                 except Exception as exc:
+                    print(f"{self._log_prefix}: tool '{final_name}' raised error: {exc}")
                     result_text = f"Tool '{final_name}' raised an error: {exc}"
 
         payload = {
@@ -293,6 +304,11 @@ async def handle_media_stream_async(ws, app):
 
                         if response['type'] in LOG_EVENT_TYPES:
                             print(f"Received event: {response['type']}", response)
+
+                        if response.get('type') == 'input_audio_buffer.speech_stopped':
+                            print("🗣️  Speech stopped detected; requesting model response.")
+                            await openai_ws.send(json.dumps({"type": "response.create"}))
+                            continue
 
                         if response.get('type') == 'response.output_audio.delta' and 'delta' in response:
                             audio_payload = base64.b64encode(base64.b64decode(response['delta'])).decode('utf-8')
