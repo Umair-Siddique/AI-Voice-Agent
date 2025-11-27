@@ -5,6 +5,8 @@ from extensions import init_openai
 from blueprints.voice_assistant import voice_assistant_bp
 from blueprints.sms_assistant import sms_assistant_bp
 from blueprints.whatsapp_assistant import whatsapp_assistant_bp
+from blueprints.mcp_server import mcp_bp
+from blueprints.voice_ai_mcp import voice_mcp_bp
 
 from flask_cors import CORS
 from flask_sock import Sock
@@ -32,10 +34,16 @@ def create_app():
     app.register_blueprint(voice_assistant_bp, url_prefix="/voice")
     app.register_blueprint(sms_assistant_bp, url_prefix="/sms")
     app.register_blueprint(whatsapp_assistant_bp, url_prefix="/whatsapp")
+    app.register_blueprint(mcp_bp, url_prefix="/mcp")
+    app.register_blueprint(voice_mcp_bp,url_prefix="/voicemcp")
 
     # Register WebSocket routes
     from blueprints.voice_assistant import register_websocket_routes
     register_websocket_routes(sock, app)
+    
+    # Register WebSocket routes for voice_mcp
+    from blueprints.voice_ai_mcp import register_websocket_routes as register_voice_mcp_websocket_routes
+    register_voice_mcp_websocket_routes(sock, app)
 
     
     return app
