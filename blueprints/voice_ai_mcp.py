@@ -8,6 +8,7 @@ import struct
 from typing import List, Optional
 
 import numpy as np
+import requests
 
 from flask import Blueprint, request, Response, jsonify, current_app
 from twilio.twiml.voice_response import VoiceResponse, Connect
@@ -208,15 +209,33 @@ def pcm16_to_wav_buffer(pcm_bytes: bytes, sample_rate: int = 8000) -> io.BytesIO
     return buffer
 
 
-def transcribe_audio_chunk(client: OpenAI, pcm_chunk: bytes) -> str:
+def transcribe_audio_chunk(api_key: str, pcm_chunk: bytes) -> str:
     wav_buffer = pcm16_to_wav_buffer(pcm_chunk)
-    transcript = client.audio.transcriptions.create(
-        model=Config.STT_MODEL,
-        file=wav_buffer,
-        response_format="json"
+    wav_bytes = wav_buffer.getvalue()
+    if not wav_bytes:
+        return ""
+
+    files = {
+        "file": ("twilio-chunk.wav", wav_bytes, "audio/wav")
+    }
+    data = {
+        "model": Config.STT_MODEL,
+        "response_format": "json"
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}"
+    }
+
+    response = requests.post(
+        "https://api.openai.com/v1/audio/transcriptions",
+        headers=headers,
+        data=data,
+        files=files,
+        timeout=30
     )
-    text = getattr(transcript, "text", "")
-    return text.strip()
+    response.raise_for_status()
+    payload = response.json()
+    return payload.get("text", "").strip()
 
 
 def call_llm(client: OpenAI, conversation_history: List[dict]) -> str:
@@ -368,6 +387,10 @@ async def handle_media_stream_async(ws, app):
     except Exception as exc:
         print(f"Unable to initialize OpenAI client: {exc}")
         return
+    api_key = app.config.get("OPENAI_API_KEY")
+    if not api_key:
+        print("Missing OPENAI_API_KEY in app config.")
+        return
 
     stream_sid = None
     loop = asyncio.get_event_loop()
@@ -418,10 +441,10 @@ async def handle_media_stream_async(ws, app):
 
             try:
                 transcript = await loop.run_in_executor(
-                    None, transcribe_audio_chunk, client, chunk
+                    None, transcribe_audio_chunk, api_key, chunk
                 )
             except Exception as exc:
-                print(f"Transcription failed: {exc}")
+                print(f"STT error: {exc}")
                 continue
 
             if not transcript:
