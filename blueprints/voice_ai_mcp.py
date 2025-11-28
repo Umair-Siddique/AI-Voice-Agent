@@ -10,6 +10,7 @@ from typing import List, Optional
 
 import numpy as np
 import requests
+from urllib.parse import urlparse
 
 from flask import Blueprint, request, Response, jsonify, current_app
 from twilio.twiml.voice_response import VoiceResponse, Connect
@@ -34,6 +35,22 @@ def index_page():
 @voice_mcp_bp.route("/incoming-call", methods=["GET", "POST"])
 def handle_incoming_call():
     """Handle incoming call and return TwiML response to connect to Media Stream."""
+    def resolve_public_host() -> str:
+        # Highest priority: explicit config
+        if Config.RENDER_EXTERNAL_URL:
+            parsed = urlparse(Config.RENDER_EXTERNAL_URL)
+            if parsed.hostname:
+                return parsed.hostname
+            return Config.RENDER_EXTERNAL_URL.replace('https://', '').replace('http://', '').rstrip('/')
+        # Next: forwarded host set by Render's proxy
+        xf_host = request.headers.get('X-Forwarded-Host')
+        if xf_host:
+            # X-Forwarded-Host can be a CSV; take first
+            return xf_host.split(',')[0].strip().split(':')[0]
+        # Fallback: Host header or request.host (strip port)
+        host = request.headers.get('Host', request.host or '')
+        return host.split(':')[0]
+
     response = VoiceResponse()
     # <Say> punctuation to improve text-to-speech flow
     response.say(
@@ -45,15 +62,10 @@ def handle_incoming_call():
         "O.K. you can start talking!",
         voice="Google.en-US-Chirp3-HD-Aoede"
     )
-    # Get the host - Render provides RENDER_EXTERNAL_URL, fallback to request.host
-    render_url = Config.RENDER_EXTERNAL_URL
-    if render_url:
-        # Extract hostname from full URL (e.g., https://app.onrender.com -> app.onrender.com)
-        host = render_url.replace('https://', '').replace('http://', '').rstrip('/')
-    else:
-        host = request.host
-    # Ensure wss:// protocol for WebSocket
+    # Compute public host for Twilio to connect back via WSS
+    host = resolve_public_host()
     ws_url = f'wss://{host}/voicemcp/media-stream'
+    print(f"[voicemcp] WS URL for Twilio Connect: {ws_url} | XFH={request.headers.get('X-Forwarded-Host')} Host={request.headers.get('Host')}")
     connect = Connect()
     connect.stream(url=ws_url)
     response.append(connect)
@@ -273,15 +285,29 @@ def call_llm(client: OpenAI, conversation_history: List[dict]) -> str:
 def synthesize_speech_mulaw(client: OpenAI, text: str) -> bytes:
     if not text:
         return b""
-    speech = client.audio.speech.create(
-        model=Config.TTS_MODEL,
-        voice=VOICE,
-        input=text,
-        format="wav",
-        sample_rate=8000
-    )
-    wav_bytes = speech.read()
-    return wav_bytes_to_mulaw(wav_bytes)
+    try:
+        # Request raw PCM at 8k to avoid WAV header parsing and resampling
+        speech = client.audio.speech.create(
+            model=Config.TTS_MODEL,
+            voice=VOICE,
+            input=text,
+            format="pcm",
+            sample_rate=8000
+        )
+        pcm_bytes = speech.read()
+        samples = np.frombuffer(pcm_bytes, dtype=np.int16)
+        return linear_pcm_to_mulaw_bytes(samples)
+    except Exception as exc:
+        print(f"TTS (pcm) failed, falling back to wav: {exc}")
+        speech = client.audio.speech.create(
+            model=Config.TTS_MODEL,
+            voice=VOICE,
+            input=text,
+            format="wav",
+            sample_rate=8000
+        )
+        wav_bytes = speech.read()
+        return wav_bytes_to_mulaw(wav_bytes)
 
 
 def wav_bytes_to_mulaw(wav_bytes: bytes) -> bytes:
@@ -423,6 +449,7 @@ async def handle_media_stream_async(ws, app):
 
                 if event_type == "start":
                     stream_sid = data["start"]["streamSid"]
+                    print(f"[voicemcp:{stream_sid}] stream started")
                     chunker.reset()
                     continue
 
@@ -437,6 +464,7 @@ async def handle_media_stream_async(ws, app):
                     continue
 
                 if event_type == "stop":
+                    print(f"[voicemcp:{stream_sid}] stream stop received, flushing")
                     flush_chunk = chunker.flush()
                     if flush_chunk:
                         await audio_queue.put(flush_chunk)
@@ -461,9 +489,11 @@ async def handle_media_stream_async(ws, app):
                 continue
 
             if not transcript:
+                # Quiet chunk, ignore
                 continue
 
             conversation_history.append({"role": "user", "content": transcript})
+            print(f"[voicemcp:{stream_sid}] user: {transcript}")
 
             try:
                 assistant_text = await loop.run_in_executor(
@@ -478,6 +508,7 @@ async def handle_media_stream_async(ws, app):
                 continue
 
             conversation_history.append({"role": "assistant", "content": assistant_text})
+            print(f"[voicemcp:{stream_sid}] assistant: {assistant_text}")
 
             try:
                 mulaw_bytes = await loop.run_in_executor(
