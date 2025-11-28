@@ -2,10 +2,12 @@ import json
 import base64
 import asyncio
 import threading
-import audioop
 import io
 import wave
+import struct
 from typing import List, Optional
+
+import numpy as np
 
 from flask import Blueprint, request, Response, jsonify, current_app
 from twilio.twiml.voice_response import VoiceResponse, Connect
@@ -72,7 +74,7 @@ class SpeechChunker:
         if not pcm_frame:
             return None
 
-        energy = audioop.rms(pcm_frame, 2)
+        energy = frame_rms(pcm_frame)
         if energy > self.rms_threshold:
             self.is_active = True
             self.silence_frames = 0
@@ -113,6 +115,69 @@ class SpeechChunker:
         return chunk
 
 
+def frame_rms(pcm_frame: bytes) -> float:
+    if not pcm_frame:
+        return 0.0
+    samples = np.frombuffer(pcm_frame, dtype=np.int16)
+    if samples.size == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
+
+
+_MULAW_BIAS = 0x84
+_MULAW_CLIP = 32635
+
+
+def _mulaw_byte_to_pcm(byte_value: int) -> int:
+    byte_value = ~byte_value & 0xFF
+    sign = byte_value & 0x80
+    exponent = (byte_value >> 4) & 0x07
+    mantissa = byte_value & 0x0F
+    sample = ((mantissa << 3) + _MULAW_BIAS) << exponent
+    sample -= _MULAW_BIAS
+    return -sample if sign else sample
+
+
+def mulaw_to_linear_bytes(mulaw_bytes: bytes) -> bytes:
+    if not mulaw_bytes:
+        return b""
+    pcm = bytearray(len(mulaw_bytes) * 2)
+    for idx, byte_value in enumerate(mulaw_bytes):
+        sample = _mulaw_byte_to_pcm(byte_value)
+        struct.pack_into("<h", pcm, idx * 2, sample)
+    return bytes(pcm)
+
+
+def _linear_sample_to_mulaw(sample: int) -> int:
+    sample = max(-32768, min(32767, sample))
+    sign = 0 if sample >= 0 else 0x80
+    if sign:
+        sample = -sample
+    sample += _MULAW_BIAS
+    if sample > _MULAW_CLIP:
+        sample = _MULAW_CLIP
+
+    exponent = 7
+    mask = 0x4000
+    while exponent > 0 and not (sample & mask):
+        mask >>= 1
+        exponent -= 1
+
+    mantissa = (sample >> (exponent + 3)) & 0x0F
+    ulaw_byte = ~(sign | (exponent << 4) | mantissa) & 0xFF
+    return ulaw_byte
+
+
+def linear_pcm_to_mulaw_bytes(samples: np.ndarray) -> bytes:
+    if samples.size == 0:
+        return b""
+    samples = samples.astype(np.int16, copy=False)
+    encoded = bytearray(samples.size)
+    for idx, sample in enumerate(samples):
+        encoded[idx] = _linear_sample_to_mulaw(int(sample))
+    return bytes(encoded)
+
+
 def ensure_openai_client(app) -> OpenAI:
     client = getattr(app, "openai_client", None)
     if client:
@@ -128,7 +193,7 @@ def ensure_openai_client(app) -> OpenAI:
 def decode_twilio_payload(payload: str) -> bytes:
     """Convert Twilio μ-law base64 audio into PCM16 bytes."""
     mulaw = base64.b64decode(payload)
-    return audioop.ulaw2lin(mulaw, 2)
+    return mulaw_to_linear_bytes(mulaw)
 
 
 def pcm16_to_wav_buffer(pcm_bytes: bytes, sample_rate: int = 8000) -> io.BytesIO:
@@ -196,15 +261,31 @@ def wav_bytes_to_mulaw(wav_bytes: bytes) -> bytes:
         channels = wav_file.getnchannels()
         framerate = wav_file.getframerate()
 
-    if channels > 1:
-        frames = audioop.tomono(frames, sample_width, 0.5, 0.5)
-    if sample_width != 2:
-        frames = audioop.lin2lin(frames, sample_width, 2)
-        sample_width = 2
-    if framerate != 8000:
-        frames, _ = audioop.ratecv(frames, sample_width, 1, framerate, 8000, None)
+    dtype_map = {1: np.uint8, 2: np.int16, 4: np.int32}
+    dtype = dtype_map.get(sample_width)
+    if dtype is None:
+        raise ValueError("Unsupported sample width returned from TTS response.")
 
-    return audioop.lin2ulaw(frames, 2)
+    samples = np.frombuffer(frames, dtype=dtype)
+
+    if sample_width == 1:
+        samples = (samples.astype(np.int16) - 128) << 8
+    elif sample_width == 2:
+        samples = samples.astype(np.int16, copy=False)
+    else:  # 32-bit
+        samples = (samples >> 16).astype(np.int16)
+
+    if channels > 1:
+        samples = samples.reshape(-1, channels).mean(axis=1).astype(np.int16)
+
+    if framerate != 8000 and samples.size > 0:
+        duration = samples.size / framerate
+        target_len = max(1, int(duration * 8000))
+        x_old = np.linspace(0, duration, samples.size, endpoint=False)
+        x_new = np.linspace(0, duration, target_len, endpoint=False)
+        samples = np.interp(x_new, x_old, samples).astype(np.int16)
+
+    return linear_pcm_to_mulaw_bytes(samples)
 
 
 async def stream_audio_to_twilio(ws, stream_sid: Optional[str], mulaw_bytes: bytes):
