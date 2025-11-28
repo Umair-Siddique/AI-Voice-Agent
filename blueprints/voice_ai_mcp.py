@@ -2,209 +2,51 @@ import json
 import base64
 import asyncio
 import threading
+import audioop
 import io
 import wave
-try:
-    import audioop
-except ModuleNotFoundError:  # Python 3.13 removed audioop
-    import audioop_lts as audioop
-import uuid
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 
-from flask import Blueprint, request, Response, jsonify
+from flask import Blueprint, request, Response, jsonify, current_app
 from twilio.twiml.voice_response import VoiceResponse, Connect
+from openai import OpenAI
 
 from config import Config
 from utils import SYSTEM_MESSAGE
-from blueprints import mcp_server
-
-VOICE = getattr(Config, "VOICE_TTS_VOICE", "alloy")
-STT_MODEL = getattr(Config, "VOICE_STT_MODEL", "gpt-4o-mini-transcribe")
-TTS_MODEL = getattr(Config, "VOICE_TTS_MODEL", "gpt-4o-mini-tts")
-LLM_MODEL = getattr(Config, "VOICE_LLM_MODEL", getattr(mcp_server, "AGENT_MODEL", "gpt-5"))
-SILENCE_RMS_THRESHOLD = getattr(Config, "VOICE_SILENCE_THRESHOLD", 700)
-SILENCE_DURATION_MS = getattr(Config, "VOICE_SILENCE_DURATION_MS", 1200)
-MAX_UTTERANCE_MS = getattr(Config, "VOICE_MAX_UTTERANCE_MS", 6000)
-MIN_UTTERANCE_PCM_BYTES = getattr(Config, "VOICE_MIN_UTTERANCE_PCM_BYTES", 3200)
-TWILIO_CHUNK_SAMPLES = 160  # 20ms of mono @ 8kHz in µ-law
+VOICE = 'alloy'
+FRAME_MS = 20
+SILENCE_FRAMES = 12  # ~240ms of silence before we close a chunk
+RMS_THRESHOLD = 200  # basic VAD level, tuned for μ-law 8kHz
+MAX_CHUNK_FRAMES = 400  # cap user turns to ~8 seconds
 
 voice_mcp_bp = Blueprint('voicemcp', __name__)
-voice_conversations: Dict[str, List[Dict[str, str]]] = {}
-
-
-def _ensure_conversation(session_id: str) -> List[Dict[str, str]]:
-    if session_id not in voice_conversations:
-        voice_conversations[session_id] = [{
-            "role": "system",
-            "content": SYSTEM_MESSAGE,
-        }]
-    return voice_conversations[session_id]
-
-
-def _extract_text_from_response(response: Any) -> str:
-    try:
-        output_text = getattr(response, "output_text", None)
-        if isinstance(output_text, str) and output_text.strip():
-            return output_text.strip()
-    except Exception:
-        pass
-
-    try:
-        first_output = response.output[0]
-        first_content = first_output.content[0]
-        text_value = (getattr(first_content, "text", "") or "").strip()
-        if text_value:
-            return text_value
-    except Exception:
-        pass
-
-    return str(response)
-
-
-async def _transcribe_pcm(pcm_bytes: bytes) -> str:
-    if not pcm_bytes or len(pcm_bytes) < MIN_UTTERANCE_PCM_BYTES:
-        return ""
-
-    def _call_openai():
-        buffer_io = io.BytesIO()
-        with wave.open(buffer_io, "wb") as wav_out:
-            wav_out.setnchannels(1)
-            wav_out.setsampwidth(2)
-            wav_out.setframerate(8000)
-            wav_out.writeframes(pcm_bytes)
-        buffer_io.seek(0)
-        result = mcp_server.openai_client.audio.transcriptions.create(
-            model=STT_MODEL,
-            file=("speech.wav", buffer_io),
-        )
-        return getattr(result, "text", "").strip()
-
-    return await asyncio.to_thread(_call_openai)
-
-
-async def _run_llm_with_tools(session_id: str, user_text: str) -> str:
-    def _call_openai():
-        messages = _ensure_conversation(session_id)
-        messages.append({"role": "user", "content": user_text})
-        try:
-            response = mcp_server.openai_client.responses.create(
-                model=LLM_MODEL,
-                input=messages,
-                tools=mcp_server._build_mcp_tools_spec(),
-            )
-        except Exception as exc:
-            raise exc
-
-        final_text = _extract_text_from_response(response)
-        messages.append({"role": "assistant", "content": final_text})
-        return final_text
-
-    return await asyncio.to_thread(_call_openai)
-
-
-def _wav_bytes_to_ulaw_chunks(wav_bytes: bytes) -> List[str]:
-    if not wav_bytes:
-        return []
-
-    wav_io = io.BytesIO(wav_bytes)
-    with wave.open(wav_io, "rb") as wav_in:
-        framerate = wav_in.getframerate()
-        sampwidth = wav_in.getsampwidth()
-        channels = wav_in.getnchannels()
-        frames = wav_in.readframes(wav_in.getnframes())
-
-    if channels > 1:
-        frames = audioop.tomono(frames, sampwidth, 0.5, 0.5)
-    if sampwidth != 2:
-        frames = audioop.lin2lin(frames, sampwidth, 2)
-    if framerate != 8000:
-        frames, _ = audioop.ratecv(frames, 2, 1, framerate, 8000, None)
-
-    ulaw_audio = audioop.lin2ulaw(frames, 2)
-
-    chunks: List[str] = []
-    for i in range(0, len(ulaw_audio), TWILIO_CHUNK_SAMPLES):
-        chunk = ulaw_audio[i:i + TWILIO_CHUNK_SAMPLES]
-        if not chunk:
-            continue
-        chunks.append(base64.b64encode(chunk).decode("utf-8"))
-    return chunks
-
-
-async def _synthesize_speech(text: str) -> List[str]:
-    if not text:
-        return []
-
-    def _call_openai():
-        with mcp_server.openai_client.audio.speech.with_streaming_response.create(
-            model=TTS_MODEL,
-            voice=VOICE,
-            input=text,
-            format="wav",
-        ) as response:
-            audio_bytes = response.read()
-        return audio_bytes
-
-    wav_bytes = await asyncio.to_thread(_call_openai)
-    return _wav_bytes_to_ulaw_chunks(wav_bytes)
-
-
-async def _stream_audio_chunks(ws, stream_sid: Optional[str], chunks: List[str]):
-    if not stream_sid or not chunks:
-        return
-
-    loop = asyncio.get_event_loop()
-    for payload in chunks:
-        media_event = {
-            "event": "media",
-            "streamSid": stream_sid,
-            "media": {"payload": payload}
-        }
-        await loop.run_in_executor(None, ws.send, json.dumps(media_event))
-        await asyncio.sleep(0.02)  # pace to approximate realtime
-
-    mark_event = {
-        "event": "mark",
-        "streamSid": stream_sid,
-        "mark": {"name": "assistantResponse"}
-    }
-    await loop.run_in_executor(None, ws.send, json.dumps(mark_event))
-
-
-def _decode_media_payload(payload: str) -> Optional[Dict[str, Any]]:
-    try:
-        media_bytes = base64.b64decode(payload)
-        pcm_chunk = audioop.ulaw2lin(media_bytes, 2)
-        rms = audioop.rms(pcm_chunk, 2)
-        return {"pcm": pcm_chunk, "rms": rms}
-    except Exception as exc:
-        print(f"Failed to decode media payload: {exc}")
-        return None
-
 
 @voice_mcp_bp.route("/", methods=["GET"])
 def index_page():
     return jsonify({"message": "Twilio Media Stream Server is running!"})
 
-
 @voice_mcp_bp.route("/incoming-call", methods=["GET", "POST"])
 def handle_incoming_call():
     """Handle incoming call and return TwiML response to connect to Media Stream."""
     response = VoiceResponse()
+    # <Say> punctuation to improve text-to-speech flow
     response.say(
         "Please wait while we connect your call to the A. I. voice assistant, powered by Twilio and the Open A I Realtime API",
         voice="Google.en-US-Chirp3-HD-Aoede"
     )
     response.pause(length=1)
-    response.say(
+    response.say(   
         "O.K. you can start talking!",
         voice="Google.en-US-Chirp3-HD-Aoede"
     )
+    # Get the host - Render provides RENDER_EXTERNAL_URL, fallback to request.host
     render_url = Config.RENDER_EXTERNAL_URL
     if render_url:
+        # Extract hostname from full URL (e.g., https://app.onrender.com -> app.onrender.com)
         host = render_url.replace('https://', '').replace('http://', '').rstrip('/')
     else:
         host = request.host
+    # Ensure wss:// protocol for WebSocket
     ws_url = f'wss://{host}/voicemcp/media-stream'
     connect = Connect()
     connect.stream(url=ws_url)
@@ -212,15 +54,202 @@ def handle_incoming_call():
     return Response(str(response), mimetype="application/xml")
 
 
+class SpeechChunker:
+    """Simple energy based VAD to break audio into short user turns."""
+
+    def __init__(self, rms_threshold: int = RMS_THRESHOLD,
+                 silence_frames: int = SILENCE_FRAMES,
+                 max_frames: int = MAX_CHUNK_FRAMES):
+        self.rms_threshold = rms_threshold
+        self.max_silence_frames = silence_frames
+        self.max_frames = max_frames
+        self.buffer = bytearray()
+        self.silence_frames = 0
+        self.active_frames = 0
+        self.is_active = False
+
+    def process_frame(self, pcm_frame: bytes) -> Optional[bytes]:
+        if not pcm_frame:
+            return None
+
+        energy = audioop.rms(pcm_frame, 2)
+        if energy > self.rms_threshold:
+            self.is_active = True
+            self.silence_frames = 0
+        elif not self.is_active:
+            return None
+        else:
+            self.silence_frames += 1
+
+        self.buffer.extend(pcm_frame)
+        self.active_frames += 1
+
+        if self.silence_frames >= self.max_silence_frames:
+            return self._finalize_chunk()
+
+        if self.active_frames >= self.max_frames:
+            return self._finalize_chunk()
+
+        return None
+
+    def flush(self) -> Optional[bytes]:
+        if not self.buffer:
+            return None
+        return self._finalize_chunk(force=True)
+
+    def reset(self):
+        self.buffer.clear()
+        self.silence_frames = 0
+        self.active_frames = 0
+        self.is_active = False
+
+    def _finalize_chunk(self, force: bool = False) -> Optional[bytes]:
+        if not self.buffer:
+            return None
+        chunk = bytes(self.buffer)
+        self.reset()
+        if not force and len(chunk) < 3200:  # skip extremely short blips (<200ms)
+            return None
+        return chunk
+
+
+def ensure_openai_client(app) -> OpenAI:
+    client = getattr(app, "openai_client", None)
+    if client:
+        return client
+    api_key = app.config.get("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("Missing OpenAI API key")
+    client = OpenAI(api_key=api_key)
+    app.openai_client = client
+    return client
+
+
+def decode_twilio_payload(payload: str) -> bytes:
+    """Convert Twilio μ-law base64 audio into PCM16 bytes."""
+    mulaw = base64.b64decode(payload)
+    return audioop.ulaw2lin(mulaw, 2)
+
+
+def pcm16_to_wav_buffer(pcm_bytes: bytes, sample_rate: int = 8000) -> io.BytesIO:
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(pcm_bytes)
+    buffer.seek(0)
+    buffer.name = "twilio-chunk.wav"
+    return buffer
+
+
+def transcribe_audio_chunk(client: OpenAI, pcm_chunk: bytes) -> str:
+    wav_buffer = pcm16_to_wav_buffer(pcm_chunk)
+    transcript = client.audio.transcriptions.create(
+        model=Config.STT_MODEL,
+        file=wav_buffer,
+        response_format="json"
+    )
+    text = getattr(transcript, "text", "")
+    return text.strip()
+
+
+def call_llm(client: OpenAI, conversation_history: List[dict]) -> str:
+    messages = [{"role": "system", "content": SYSTEM_MESSAGE}, *conversation_history]
+    result = client.chat.completions.create(
+        model=Config.GPT_MODEL,
+        temperature=Config.TEMPERATURE,
+        messages=messages
+    )
+    message_content = result.choices[0].message.content
+    if isinstance(message_content, list):
+        text = " ".join(
+            part.get("text", "")
+            for part in message_content
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+    else:
+        text = message_content or ""
+    return text.strip()
+
+
+def synthesize_speech_mulaw(client: OpenAI, text: str) -> bytes:
+    if not text:
+        return b""
+    speech = client.audio.speech.create(
+        model=Config.TTS_MODEL,
+        voice=VOICE,
+        input=text,
+        format="wav",
+        sample_rate=8000
+    )
+    wav_bytes = speech.read()
+    return wav_bytes_to_mulaw(wav_bytes)
+
+
+def wav_bytes_to_mulaw(wav_bytes: bytes) -> bytes:
+    if not wav_bytes:
+        return b""
+    with wave.open(io.BytesIO(wav_bytes), "rb") as wav_file:
+        frames = wav_file.readframes(wav_file.getnframes())
+        sample_width = wav_file.getsampwidth()
+        channels = wav_file.getnchannels()
+        framerate = wav_file.getframerate()
+
+    if channels > 1:
+        frames = audioop.tomono(frames, sample_width, 0.5, 0.5)
+    if sample_width != 2:
+        frames = audioop.lin2lin(frames, sample_width, 2)
+        sample_width = 2
+    if framerate != 8000:
+        frames, _ = audioop.ratecv(frames, sample_width, 1, framerate, 8000, None)
+
+    return audioop.lin2ulaw(frames, 2)
+
+
+async def stream_audio_to_twilio(ws, stream_sid: Optional[str], mulaw_bytes: bytes):
+    if not stream_sid or not mulaw_bytes:
+        return
+
+    frame_size = 160  # 20ms of μ-law audio at 8kHz
+    loop = asyncio.get_event_loop()
+
+    for idx in range(0, len(mulaw_bytes), frame_size):
+        frame = mulaw_bytes[idx:idx + frame_size]
+        if not frame:
+            continue
+        payload = base64.b64encode(frame).decode("utf-8")
+        media_message = {
+            "event": "media",
+            "streamSid": stream_sid,
+            "media": {"payload": payload}
+        }
+        try:
+            await loop.run_in_executor(None, ws.send, json.dumps(media_message))
+        except Exception as exc:
+            print(f"Error sending audio frame to Twilio: {exc}")
+            break
+        await asyncio.sleep(FRAME_MS / 1000)
+
+    mark_event = {
+        "event": "mark",
+        "streamSid": stream_sid,
+        "mark": {"name": "assistantComplete"}
+    }
+    try:
+        await loop.run_in_executor(None, ws.send, json.dumps(mark_event))
+    except Exception as exc:
+        print(f"Error sending mark event: {exc}")
+
 def register_websocket_routes(sock, app):
     """Register WebSocket routes with the sock instance."""
 
     @sock.route('/voicemcp/media-stream', endpoint='voicemcp_media_stream')
     def handle_media_stream(ws):
-        print("Client connected")
+        """Bridge a Twilio media stream to STT -> GPT -> TTS."""
+        print("Client connected to /voicemcp/media-stream")
 
         loop = None
-        thread = None
 
         def run_async_handler():
             nonlocal loop
@@ -228,8 +257,8 @@ def register_websocket_routes(sock, app):
             asyncio.set_event_loop(loop)
             try:
                 loop.run_until_complete(handle_media_stream_async(ws, app))
-            except Exception as e:
-                print(f"Error in handle_media_stream: {e}")
+            except Exception as exc:
+                print(f"Error in handle_media_stream_async: {exc}")
                 import traceback
                 traceback.print_exc()
             finally:
@@ -239,10 +268,12 @@ def register_websocket_routes(sock, app):
                         for task in pending:
                             task.cancel()
                         if pending:
-                            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                            loop.run_until_complete(
+                                asyncio.gather(*pending, return_exceptions=True)
+                            )
                         loop.close()
-                except Exception as e:
-                    print(f"Error during cleanup: {e}")
+                except Exception as cleanup_exc:
+                    print(f"Error during websocket cleanup: {cleanup_exc}")
 
         thread = threading.Thread(target=run_async_handler, daemon=False)
         thread.start()
@@ -250,131 +281,96 @@ def register_websocket_routes(sock, app):
 
 
 async def handle_media_stream_async(ws, app):
-    OPENAI_API_KEY = app.config.get('OPENAI_API_KEY')
-    if not OPENAI_API_KEY:
-        print("Error: Missing OpenAI API key")
+    """Async bridge that performs STT -> GPT -> TTS for each user turn."""
+    try:
+        client = ensure_openai_client(app)
+    except Exception as exc:
+        print(f"Unable to initialize OpenAI client: {exc}")
         return
 
-    state: Dict[str, Any] = {
-        "stream_sid": None,
-        "session_id": str(uuid.uuid4()),
-        "buffer": bytearray(),
-        "speech_active": False,
-        "last_voice_ts": 0,
-        "last_chunk_ts": 0,
-        "segment_start_ts": 0,
-        "collecting": False,
-        "closed": False,
-    }
-
-    segments_queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
+    stream_sid = None
     loop = asyncio.get_event_loop()
+    chunker = SpeechChunker()
+    audio_queue: asyncio.Queue = asyncio.Queue()
+    conversation_history: List[dict] = []
 
-    async def process_segments():
-        while True:
-            segment = await segments_queue.get()
-            if segment is None:
-                break
-            await handle_segment(segment)
-
-    async def handle_segment(segment: bytes):
-        if len(segment) < MIN_UTTERANCE_PCM_BYTES:
-            return
-
+    async def receive_from_twilio():
+        nonlocal stream_sid
         try:
-            transcript = await _transcribe_pcm(segment)
-        except Exception as exc:
-            print(f"[{state['session_id']}] STT error: {exc}")
-            return
-
-        if not transcript:
-            print(f"[{state['session_id']}] Empty transcript, skipping")
-            return
-
-        print(f"[{state['session_id']}] User said: {transcript}")
-
-        try:
-            assistant_reply = await _run_llm_with_tools(state["session_id"], transcript)
-        except Exception as exc:
-            print(f"[{state['session_id']}] LLM error: {exc}")
-            assistant_reply = "Sorry, I'm having trouble reaching our assistant right now."
-
-        print(f"[{state['session_id']}] Assistant reply: {assistant_reply}")
-
-        try:
-            chunks = await _synthesize_speech(assistant_reply)
-        except Exception as exc:
-            print(f"[{state['session_id']}] TTS error: {exc}")
-            return
-
-        await _stream_audio_chunks(ws, state["stream_sid"], chunks)
-
-    processor_task = asyncio.create_task(process_segments())
-
-    async def flush_buffer(force: bool = False):
-        if not state["buffer"]:
-            return
-        if not force and len(state["buffer"]) < MIN_UTTERANCE_PCM_BYTES:
-            state["buffer"].clear()
-            state["collecting"] = False
-            state["segment_start_ts"] = 0
-            return
-
-        segment = bytes(state["buffer"])
-        state["buffer"].clear()
-        state["collecting"] = False
-        state["segment_start_ts"] = 0
-        try:
-            await segments_queue.put(segment)
-        except asyncio.QueueClosedError:
-            pass
-
-    try:
-        while True:
-            message = await loop.run_in_executor(None, ws.receive)
-            if message is None:
-                break
-            try:
+            while True:
+                message = await loop.run_in_executor(None, ws.receive)
+                if message is None:
+                    break
                 data = json.loads(message)
-            except json.JSONDecodeError:
+                event_type = data.get("event")
+
+                if event_type == "start":
+                    stream_sid = data["start"]["streamSid"]
+                    chunker.reset()
+                    continue
+
+                if event_type == "media":
+                    payload = data.get("media", {}).get("payload")
+                    if not payload:
+                        continue
+                    pcm_frame = decode_twilio_payload(payload)
+                    chunk = chunker.process_frame(pcm_frame)
+                    if chunk:
+                        await audio_queue.put(chunk)
+                    continue
+
+                if event_type == "stop":
+                    flush_chunk = chunker.flush()
+                    if flush_chunk:
+                        await audio_queue.put(flush_chunk)
+                    break
+        except Exception as exc:
+            print(f"Error receiving stream from Twilio: {exc}")
+        finally:
+            await audio_queue.put(None)
+
+    async def process_turns():
+        while True:
+            chunk = await audio_queue.get()
+            if chunk is None:
+                break
+
+            try:
+                transcript = await loop.run_in_executor(
+                    None, transcribe_audio_chunk, client, chunk
+                )
+            except Exception as exc:
+                print(f"Transcription failed: {exc}")
                 continue
 
-            event = data.get("event")
-            if event == "start":
-                state["stream_sid"] = data["start"]["streamSid"]
-                print(f"[{state['session_id']}] Incoming stream {state['stream_sid']} started")
-            elif event == "media":
-                decoded = _decode_media_payload(data["media"]["payload"])
-                if not decoded:
-                    continue
-                timestamp = int(data["media"]["timestamp"])
-                if not state["collecting"]:
-                    state["collecting"] = True
-                    state["segment_start_ts"] = timestamp
-                state["buffer"].extend(decoded["pcm"])
-                state["last_chunk_ts"] = timestamp
-                if decoded["rms"] > SILENCE_RMS_THRESHOLD:
-                    state["speech_active"] = True
-                    state["last_voice_ts"] = timestamp
+            if not transcript:
+                continue
 
-                silence_gap = timestamp - state["last_voice_ts"]
-                segment_age = timestamp - state["segment_start_ts"]
+            conversation_history.append({"role": "user", "content": transcript})
 
-                should_finalize = False
-                if state["speech_active"] and silence_gap >= SILENCE_DURATION_MS:
-                    should_finalize = True
-                    state["speech_active"] = False
-                elif state["collecting"] and segment_age >= MAX_UTTERANCE_MS:
-                    should_finalize = True
+            try:
+                assistant_text = await loop.run_in_executor(
+                    None, call_llm, client, conversation_history
+                )
+            except Exception as exc:
+                print(f"LLM call failed: {exc}")
+                conversation_history.pop()  # remove user turn to retry later
+                continue
 
-                if should_finalize:
-                    await flush_buffer()
-            elif event == "stop":
-                await flush_buffer(force=True)
-                break
-    except Exception as exc:
-        print(f"[{state['session_id']}] Error in Twilio loop: {exc}")
-    finally:
-        state["closed"] = True
-        await segments_queue.put(None)
-        await processor_task
+            if not assistant_text:
+                continue
+
+            conversation_history.append({"role": "assistant", "content": assistant_text})
+
+            try:
+                mulaw_bytes = await loop.run_in_executor(
+                    None, synthesize_speech_mulaw, client, assistant_text
+                )
+            except Exception as exc:
+                print(f"TTS synthesis failed: {exc}")
+                continue
+
+            await stream_audio_to_twilio(ws, stream_sid, mulaw_bytes)
+
+    await asyncio.gather(receive_from_twilio(), process_turns())
+
