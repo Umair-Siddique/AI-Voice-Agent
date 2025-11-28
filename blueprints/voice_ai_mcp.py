@@ -5,6 +5,7 @@ import threading
 import io
 import wave
 import struct
+import time
 from typing import List, Optional
 
 import numpy as np
@@ -21,6 +22,8 @@ FRAME_MS = 20
 SILENCE_FRAMES = 12  # ~240ms of silence before we close a chunk
 RMS_THRESHOLD = 200  # basic VAD level, tuned for μ-law 8kHz
 MAX_CHUNK_FRAMES = 400  # cap user turns to ~8 seconds
+STT_ENDPOINT = "https://api.openai.com/v1/audio/transcriptions"
+STT_MAX_RETRIES = 3
 
 voice_mcp_bp = Blueprint('voicemcp', __name__)
 
@@ -215,27 +218,37 @@ def transcribe_audio_chunk(api_key: str, pcm_chunk: bytes) -> str:
     if not wav_bytes:
         return ""
 
-    files = {
-        "file": ("twilio-chunk.wav", wav_bytes, "audio/wav")
-    }
-    data = {
-        "model": Config.STT_MODEL,
-        "response_format": "json"
-    }
-    headers = {
-        "Authorization": f"Bearer {api_key}"
-    }
+    files = {"file": ("twilio-chunk.wav", wav_bytes, "audio/wav")}
+    data = {"model": Config.STT_MODEL, "response_format": "json"}
+    headers = {"Authorization": f"Bearer {api_key}"}
+    last_error = None
 
-    response = requests.post(
-        "https://api.openai.com/v1/audio/transcriptions",
-        headers=headers,
-        data=data,
-        files=files,
-        timeout=30
-    )
-    response.raise_for_status()
-    payload = response.json()
-    return payload.get("text", "").strip()
+    for attempt in range(1, STT_MAX_RETRIES + 1):
+        try:
+            response = requests.post(
+                STT_ENDPOINT,
+                headers=headers,
+                data=data,
+                files=files,
+                timeout=60
+            )
+            response.raise_for_status()
+            payload = response.json()
+            return payload.get("text", "").strip()
+        except requests.exceptions.RequestException as exc:
+            status = getattr(exc.response, "status_code", "no-status")
+            body = exc.response.text[:500] if getattr(exc, "response", None) else ""
+            print(
+                f"STT request attempt {attempt}/{STT_MAX_RETRIES} failed "
+                f"status={status}: {exc}. body='{body}'"
+            )
+            last_error = exc
+            if attempt < STT_MAX_RETRIES:
+                time.sleep(0.5 * attempt)
+            else:
+                raise
+
+    raise RuntimeError(f"STT failed after {STT_MAX_RETRIES} retries: {last_error}")
 
 
 def call_llm(client: OpenAI, conversation_history: List[dict]) -> str:
