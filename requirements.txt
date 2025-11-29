@@ -5,8 +5,9 @@ flask_cors
 websockets
 flask-sock
 twilio
-gunicorn
-gevent
+gunicorn>=21.2.0
+gevent==24.11.2
+greenlet>=3.0.3
 fastmcp
 requests
 SpeechRecognition==3.10.4 ; sys_platform == "win32"
