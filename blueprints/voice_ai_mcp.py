@@ -3,7 +3,6 @@ import sys
 import json
 import asyncio
 import importlib.util
-import traceback
 from typing import Any, Dict, List, Optional
 
 # Ensure project root is importable when run as a script
@@ -20,29 +19,16 @@ try:
 except Exception as _e:
     pyttsx3 = None
 
-from flask import Blueprint, jsonify, request, Response, current_app
+from flask import Blueprint, jsonify
 from openai import OpenAI
-from twilio.twiml.voice_response import VoiceResponse
 from config import Config
 from utils import SYSTEM_MESSAGE
 
 voice_mcp_bp = Blueprint("voice_mcp", __name__)
-_TWILIO_SESSIONS: Dict[str, Dict[str, Any]] = {}
-_TWILIO_SAY_VOICE = os.getenv("VOICE_MCP_TWILIO_VOICE", "Google.en-US-Chirp3-HD-Aoede")
-_DEFAULT_OPENAI_CLIENT: Optional[OpenAI] = None
 
 # Optional MCP imports for tool calling (like mcp_server)
 _MCP_AVAILABLE = False
 _MCP_IMPORT_ERROR = ""
-openai_client: Optional[OpenAI] = None
-_build_mcp_tools_spec = None
-_extract_json_object = None
-_mcp_call = None
-_mcp_tools_brief = None
-_fetch_tool_schema = None
-AGENT_MODEL: Optional[str] = None
-AGENT_MAX_STEPS: Optional[int] = None
-SIMPLYBOOK_MCP_URL: Optional[str] = None
 try:
     if __package__:
         from . import mcp_server as _mcp_module
@@ -67,47 +53,6 @@ try:
 except Exception as _e:
     _MCP_IMPORT_ERROR = str(_e)
     _MCP_AVAILABLE = False
-    openai_client = None
-
-
-def _get_openai_client() -> OpenAI:
-    """
-    Prefer the Flask-initialised OpenAI client (used by other blueprints) so
-    credentials/config stay consistent in every deployment. Fall back to a
-    lazily-created client for CLI/testing contexts where Flask isn't running.
-    """
-    global _DEFAULT_OPENAI_CLIENT
-    try:
-        if current_app:
-            app_client = getattr(current_app, "openai_client", None)
-            if app_client is not None:
-                return app_client
-    except RuntimeError:
-        # No application context (CLI usage), fall back to local client.
-        pass
-
-    if _DEFAULT_OPENAI_CLIENT is None:
-        if not Config.OPENAI_API_KEY:
-            raise RuntimeError(
-                "OPENAI_API_KEY is not configured. Set it in your environment "
-                "or provide it via Flask app config."
-            )
-        _DEFAULT_OPENAI_CLIENT = OpenAI(api_key=Config.OPENAI_API_KEY)
-    return _DEFAULT_OPENAI_CLIENT
-
-
-def _log_openai_exception(context: str, exc: Exception) -> None:
-    """
-    Emit detailed diagnostics for OpenAI client failures so production logs
-    clarify whether the issue is auth, networking, etc.
-    """
-    print(f"[OpenAI error] {context}: {exc} ({exc.__class__.__name__})")
-    traceback.print_exc()
-
-
-# Always align with the app-level OpenAI client so credentials and transports
-# match the other voice/SMS blueprints.
-openai_client = _get_openai_client()
 
 
 @voice_mcp_bp.route("/", methods=["GET"])
@@ -221,19 +166,13 @@ class SimpleVoiceAgent:
         self.session_id = session_id
         self.messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_MESSAGE},
-            {
-                "role": "system",
-                "content": (
-                    "Speak in ≤2 short sentences. Before acting on bookings, always confirm the "
-                    "specific client and appointment time so there is zero ambiguity."
-                ),
-            },
+            {"role": "system", "content": "Be extremely brief (≤ 2 short sentences). Respond quickly."},
         ]
         # Allow overriding to a faster model via env var if desired
         self.model = (os.getenv("GPT_FAST_MODEL") or Config.GPT_MODEL or "gpt-5")
         if not Config.OPENAI_API_KEY:
             print("⚠️  OPENAI_API_KEY is not set. Set it via environment or .env")
-        self.client = _get_openai_client()
+        self.client = OpenAI(api_key=Config.OPENAI_API_KEY)
 
     def _prune_history(self, max_turns: int = 2) -> None:
         """
@@ -256,7 +195,7 @@ class SimpleVoiceAgent:
                 input=self.messages,
             )
         except Exception as exc:
-            _log_openai_exception("SimpleVoiceAgent.run_turn", exc)
+            print(f"[OpenAI error] {exc}")
             return "I hit an error contacting the AI model. Please try again."
 
         assistant_text = ""
@@ -299,13 +238,7 @@ class ToolsAPIEnabledVoiceAgent:
         self.session_id = session_id
         self.messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_MESSAGE},
-            {
-                "role": "system",
-                "content": (
-                    "Be concise and speakable. Use tools when helpful. Confirm exact client identity "
-                    "and appointment slot before calling any reschedule, cancel, or booking tool."
-                ),
-            },
+            {"role": "system", "content": "Be concise and speakable. Use tools when helpful."},
         ]
         # Use same model family as server
         self.model = AGENT_MODEL
@@ -354,7 +287,7 @@ class ToolsAPIEnabledVoiceAgent:
                 tools=_build_mcp_tools_spec(),
             )
         except Exception as exc:
-            _log_openai_exception("ToolsAPIEnabledVoiceAgent.run_turn", exc)
+            print(f"[OpenAI error] {exc}")
             return "I hit an error contacting the AI model. Please try again."
 
         # Try to report any tool-related items
@@ -418,10 +351,6 @@ class MCPVoiceAgent:
             + "think -> act (tool) -> observe -> repeat, then provide a final answer.\n\n"
             + "Available tools:\n"
             + f"{tools_list}\n\n"
-            + "Scheduling safety:\n"
-            + "- Never assume which appointment the user wants to change.\n"
-            + "- If more than one booking matches their description, list the options, ask which client/time they mean, and wait for confirmation.\n"
-            + "- Repeat the confirmed client + appointment details before calling any reschedule, cancel, or booking tool.\n\n"
             + "Interaction protocol (STRICT):\n"
             + "1) When you need to use a tool, respond with ONLY a single JSON object:\n"
             + '{ "thought": "very brief reason", "action": "<tool_name>", "action_input": { ... } }\n'
@@ -446,7 +375,7 @@ class MCPVoiceAgent:
                     input=self.messages,
                 )
             except Exception as exc:
-                _log_openai_exception("MCPVoiceAgent.run_turn", exc)
+                print(f"[OpenAI error] {exc}")
                 return "I hit an error contacting the AI model. Please try again."
 
             # Extract assistant text
@@ -523,164 +452,45 @@ class MCPVoiceAgent:
             )
         return final_text
 
-
-def _create_voice_agent(session_id: str, emit_logs: bool = True):
-    """
-    Instantiate the appropriate agent for the given session, mirroring the CLI logic.
-    """
-    def _log(message: str) -> None:
-        if emit_logs:
-            print(message)
-
-    use_mcp = (os.getenv("VOICE_USE_MCP", "1").lower() not in ("0", "false", "no"))
-    mcp_mode = os.getenv("VOICE_MCP_MODE", "react").lower()
-    agent = None
-
-    if use_mcp and _MCP_AVAILABLE:
-        if mcp_mode == "react":
-            _log("Mode: MCP tools ENABLED (ReAct loop).")
-            try:
-                agent = MCPVoiceAgent(session_id=session_id)
-            except Exception as e:
-                _log(f"Failed to initialize MCP ReAct agent, falling back to platform tools: {e}")
-                try:
-                    agent = ToolsAPIEnabledVoiceAgent(session_id=session_id)
-                except Exception as e2:
-                    _log(f"Failed to initialize platform tools agent, falling back to chat-only: {e2}")
-                    agent = SimpleVoiceAgent(session_id=session_id)
-        else:
-            _log("Mode: MCP tools ENABLED (platform-managed tools).")
-            try:
-                agent = ToolsAPIEnabledVoiceAgent(session_id=session_id)
-            except Exception as e:
-                _log(f"Failed to initialize platform tools agent, falling back to ReAct: {e}")
-                try:
-                    agent = MCPVoiceAgent(session_id=session_id)
-                except Exception as e2:
-                    _log(f"Failed to initialize MCP ReAct agent, falling back to chat-only: {e2}")
-                    agent = SimpleVoiceAgent(session_id=session_id)
-    else:
-        if use_mcp and not _MCP_AVAILABLE:
-            reason = f" (import error: {_MCP_IMPORT_ERROR})" if _MCP_IMPORT_ERROR else ""
-            _log(f"MCP requested but not available{reason}; falling back to chat-only.")
-        else:
-            _log("Mode: Chat-only (no tools).")
-        agent = SimpleVoiceAgent(session_id=session_id)
-
-    return agent
-
-
-def _get_twilio_session(call_sid: str) -> Dict[str, Any]:
-    """
-    Return or create the state for a Twilio-driven conversation.
-    """
-    session = _TWILIO_SESSIONS.get(call_sid)
-    if session:
-        return session
-
-    agent = _create_voice_agent(session_id=f"twilio-{call_sid}", emit_logs=False)
-    session = {"agent": agent, "greeted": False}
-    _TWILIO_SESSIONS[call_sid] = session
-    return session
-
-
-def _cleanup_twilio_session(call_sid: str) -> None:
-    """
-    Remove cached session data for a finished call.
-    """
-    _TWILIO_SESSIONS.pop(call_sid, None)
-
-
-def _enqueue_twilio_gather(response_obj: VoiceResponse, action_url: str, greeted: bool) -> None:
-    """
-    Append a Gather prompt that keeps the conversation going.
-    """
-    gather = response_obj.gather(
-        input="speech",
-        action=action_url,
-        method="POST",
-        speech_timeout="auto",
-    )
-    if not greeted:
-        gather.say(
-            "Hi! You're connected to Flexbody Solution's assistant. "
-            "Please tell me the exact appointment or question you have.",
-            voice=_TWILIO_SAY_VOICE,
-        )
-    else:
-        gather.say(
-            "You can share more booking details or say exit to finish.",
-            voice=_TWILIO_SAY_VOICE,
-        )
-
-
-def _twilio_xml_response(voice_response: VoiceResponse, status: int = 200) -> Response:
-    """
-    Wrap a VoiceResponse in a Flask Response object.
-    """
-    return Response(str(voice_response), mimetype="application/xml", status=status)
-
-
-@voice_mcp_bp.route("/twilio/voice", methods=["GET", "POST"])
-def twilio_voice_webhook():
-    """
-    Twilio Programmable Voice webhook that funnels speech into the MCP agents.
-    """
-    if request.method == "GET":
-        return jsonify({
-            "success": True,
-            "message": "Twilio webhook ready. Configure this URL as your Voice webhook.",
-        })
-
-    call_sid = (request.values.get("CallSid") or "").strip()
-    resp = VoiceResponse()
-
-    if not call_sid:
-        resp.say("Missing call identifier. Please try again later.", voice=_TWILIO_SAY_VOICE)
-        resp.hangup()
-        return _twilio_xml_response(resp, status=400)
-
-    call_status = (request.values.get("CallStatus") or "").lower()
-    if call_status and call_status in {"completed", "canceled", "failed", "busy", "no-answer"}:
-        _cleanup_twilio_session(call_sid)
-
-    session = _get_twilio_session(call_sid)
-    user_text = (
-        request.values.get("SpeechResult")
-        or request.values.get("TranscriptionText")
-        or request.values.get("Digits")
-        or ""
-    ).strip()
-
-    action_url = request.url
-
-    if not user_text:
-        _enqueue_twilio_gather(resp, action_url, greeted=session.get("greeted", False))
-        session["greeted"] = True
-        return _twilio_xml_response(resp)
-
-    normalized = user_text.lower()
-    if normalized in {"exit", "quit", "stop", "bye", "goodbye"}:
-        resp.say("Thanks for calling Flexbody Solution. Goodbye!", voice=_TWILIO_SAY_VOICE)
-        resp.hangup()
-        _cleanup_twilio_session(call_sid)
-        return _twilio_xml_response(resp)
-
-    agent = session["agent"]
-    reply = agent.run_turn(user_text)
-    resp.say(reply, voice=_TWILIO_SAY_VOICE)
-    _enqueue_twilio_gather(resp, action_url, greeted=True)
-
-    return _twilio_xml_response(resp)
-
-
 def run_cli() -> None:
     _print_banner()
 
     tts = LocalTTS()
     stt = LocalSTT()
 
-    agent = _create_voice_agent(session_id="cli-voice", emit_logs=True)
+    use_mcp = (os.getenv("VOICE_USE_MCP", "1").lower() not in ("0", "false", "no"))
+    mcp_mode = os.getenv("VOICE_MCP_MODE", "react").lower()  # 'react' default, 'platform' optional
+    agent = None
+    if use_mcp and _MCP_AVAILABLE:
+        if mcp_mode == "react":
+            print("Mode: MCP tools ENABLED (ReAct loop).")
+            try:
+                agent = MCPVoiceAgent(session_id="cli-voice")
+            except Exception as e:
+                print(f"Failed to initialize MCP ReAct agent, falling back to platform tools: {e}")
+                try:
+                    agent = ToolsAPIEnabledVoiceAgent(session_id="cli-voice")
+                except Exception as e2:
+                    print(f"Failed to initialize platform tools agent, falling back to chat-only: {e2}")
+                    agent = SimpleVoiceAgent(session_id="cli-voice")
+        else:
+            print("Mode: MCP tools ENABLED (platform-managed tools).")
+            try:
+                agent = ToolsAPIEnabledVoiceAgent(session_id="cli-voice")
+            except Exception as e:
+                print(f"Failed to initialize platform tools agent, falling back to ReAct: {e}")
+                try:
+                    agent = MCPVoiceAgent(session_id="cli-voice")
+                except Exception as e2:
+                    print(f"Failed to initialize MCP ReAct agent, falling back to chat-only: {e2}")
+                    agent = SimpleVoiceAgent(session_id="cli-voice")
+    else:
+        if use_mcp and not _MCP_AVAILABLE:
+            reason = f" (import error: {_MCP_IMPORT_ERROR})" if _MCP_IMPORT_ERROR else ""
+            print(f"MCP requested but not available{reason}; falling back to chat-only.")
+        else:
+            print("Mode: Chat-only (no tools).")
+        agent = SimpleVoiceAgent(session_id="cli-voice")
 
     # If mic unavailable, fall back to text mode
     use_text_fallback = not stt.enabled
@@ -714,4 +524,8 @@ def run_cli() -> None:
         except Exception as e:
             print(f"[Loop error] {e}")
 
+
+if __name__ == "__main__":
+    # Allow: python -m blueprints.voice_ai_mcp OR direct script execution
+    run_cli()
 
