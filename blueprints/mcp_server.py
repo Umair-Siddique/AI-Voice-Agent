@@ -8,12 +8,13 @@ from flask import Blueprint, jsonify, request
 from openai import OpenAI
 from fastmcp import Client as FastMCPClient
 from utils import SYSTEM_MESSAGE
+from config import Config
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     print("⚠️  WARNING: OPENAI_API_KEY is not set. Set it in your environment.")
 
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
+openai_client = OpenAI(api_key=Config.OPENAI_API_KEY)
 
 # Remote MCP server configuration (FastMCP over SSE).
 # These values are used to register the MCP server as a tool with the
