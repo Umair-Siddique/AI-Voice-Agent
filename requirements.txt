@@ -8,5 +8,7 @@ twilio
 gunicorn
 gevent
 fastmcp
-numpy
 requests
+SpeechRecognition
+PyAudio
+pyttsx3

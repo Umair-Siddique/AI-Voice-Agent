@@ -266,6 +266,10 @@ def chat_react():
             "think -> act (tool) -> observe -> repeat, then provide a final answer.\n\n"
             "Available tools:\n"
             f"{tools_list}\n\n"
+            "Scheduling safety:\n"
+            "- Never assume which appointment the user wants to change.\n"
+            "- If multiple bookings match their description (e.g., same day or client), list those options, ask them to choose, and wait for a confirmation.\n"
+            "- Repeat the confirmed client + appointment details before calling any reschedule, cancel, or booking tool.\n\n"
             "Interaction protocol (STRICT):\n"
             "1) When you need to use a tool, respond with ONLY a single JSON object:\n"
             '{\n'
