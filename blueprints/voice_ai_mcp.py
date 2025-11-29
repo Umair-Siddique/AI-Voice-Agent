@@ -20,7 +20,7 @@ try:
 except Exception as _e:
     pyttsx3 = None
 
-from flask import Blueprint, jsonify, request, Response
+from flask import Blueprint, jsonify, request, Response, current_app
 from openai import OpenAI
 from twilio.twiml.voice_response import VoiceResponse
 from config import Config
@@ -29,10 +29,20 @@ from utils import SYSTEM_MESSAGE
 voice_mcp_bp = Blueprint("voice_mcp", __name__)
 _TWILIO_SESSIONS: Dict[str, Dict[str, Any]] = {}
 _TWILIO_SAY_VOICE = os.getenv("VOICE_MCP_TWILIO_VOICE", "Google.en-US-Chirp3-HD-Aoede")
+_DEFAULT_OPENAI_CLIENT: Optional[OpenAI] = None
 
 # Optional MCP imports for tool calling (like mcp_server)
 _MCP_AVAILABLE = False
 _MCP_IMPORT_ERROR = ""
+openai_client: Optional[OpenAI] = None
+_build_mcp_tools_spec = None
+_extract_json_object = None
+_mcp_call = None
+_mcp_tools_brief = None
+_fetch_tool_schema = None
+AGENT_MODEL: Optional[str] = None
+AGENT_MAX_STEPS: Optional[int] = None
+SIMPLYBOOK_MCP_URL: Optional[str] = None
 try:
     if __package__:
         from . import mcp_server as _mcp_module
@@ -57,6 +67,37 @@ try:
 except Exception as _e:
     _MCP_IMPORT_ERROR = str(_e)
     _MCP_AVAILABLE = False
+    openai_client = None
+
+
+def _get_openai_client() -> OpenAI:
+    """
+    Prefer the Flask-initialised OpenAI client (used by other blueprints) so
+    credentials/config stay consistent in every deployment. Fall back to a
+    lazily-created client for CLI/testing contexts where Flask isn't running.
+    """
+    global _DEFAULT_OPENAI_CLIENT
+    try:
+        if current_app:
+            app_client = getattr(current_app, "openai_client", None)
+            if app_client is not None:
+                return app_client
+    except RuntimeError:
+        # No application context (CLI usage), fall back to local client.
+        pass
+
+    if _DEFAULT_OPENAI_CLIENT is None:
+        if not Config.OPENAI_API_KEY:
+            raise RuntimeError(
+                "OPENAI_API_KEY is not configured. Set it in your environment "
+                "or provide it via Flask app config."
+            )
+        _DEFAULT_OPENAI_CLIENT = OpenAI(api_key=Config.OPENAI_API_KEY)
+    return _DEFAULT_OPENAI_CLIENT
+
+
+if openai_client is None:
+    openai_client = _get_openai_client()
 
 
 @voice_mcp_bp.route("/", methods=["GET"])
@@ -182,7 +223,7 @@ class SimpleVoiceAgent:
         self.model = (os.getenv("GPT_FAST_MODEL") or Config.GPT_MODEL or "gpt-5")
         if not Config.OPENAI_API_KEY:
             print("⚠️  OPENAI_API_KEY is not set. Set it via environment or .env")
-        self.client = OpenAI(api_key=Config.OPENAI_API_KEY)
+        self.client = _get_openai_client()
 
     def _prune_history(self, max_turns: int = 2) -> None:
         """
@@ -663,8 +704,4 @@ def run_cli() -> None:
         except Exception as e:
             print(f"[Loop error] {e}")
 
-
-if __name__ == "__main__":
-    # Allow: python -m blueprints.voice_ai_mcp OR direct script execution
-    run_cli()
 
