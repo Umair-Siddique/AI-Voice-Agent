@@ -2,8 +2,8 @@ import os
 import sys
 import json
 import asyncio
-from config import Config
 import importlib.util
+import traceback
 from typing import Any, Dict, List, Optional
 
 # Ensure project root is importable when run as a script
@@ -96,8 +96,18 @@ def _get_openai_client() -> OpenAI:
     return _DEFAULT_OPENAI_CLIENT
 
 
-if openai_client is None:
-    openai_client = _get_openai_client()
+def _log_openai_exception(context: str, exc: Exception) -> None:
+    """
+    Emit detailed diagnostics for OpenAI client failures so production logs
+    clarify whether the issue is auth, networking, etc.
+    """
+    print(f"[OpenAI error] {context}: {exc} ({exc.__class__.__name__})")
+    traceback.print_exc()
+
+
+# Always align with the app-level OpenAI client so credentials and transports
+# match the other voice/SMS blueprints.
+openai_client = _get_openai_client()
 
 
 @voice_mcp_bp.route("/", methods=["GET"])
@@ -246,7 +256,7 @@ class SimpleVoiceAgent:
                 input=self.messages,
             )
         except Exception as exc:
-            print(f"[OpenAI error] {exc}")
+            _log_openai_exception("SimpleVoiceAgent.run_turn", exc)
             return "I hit an error contacting the AI model. Please try again."
 
         assistant_text = ""
@@ -344,7 +354,7 @@ class ToolsAPIEnabledVoiceAgent:
                 tools=_build_mcp_tools_spec(),
             )
         except Exception as exc:
-            print(f"[OpenAI error] {exc}")
+            _log_openai_exception("ToolsAPIEnabledVoiceAgent.run_turn", exc)
             return "I hit an error contacting the AI model. Please try again."
 
         # Try to report any tool-related items
@@ -436,7 +446,7 @@ class MCPVoiceAgent:
                     input=self.messages,
                 )
             except Exception as exc:
-                print(f"[OpenAI error] {exc}")
+                _log_openai_exception("MCPVoiceAgent.run_turn", exc)
                 return "I hit an error contacting the AI model. Please try again."
 
             # Extract assistant text
