@@ -4,6 +4,7 @@ import json
 import asyncio
 from typing import Any, Dict, List, Optional
 
+import requests
 from flask import Blueprint, request, jsonify
 from fastmcp import Client as FastMCPClient
 from openai import OpenAI
@@ -167,29 +168,10 @@ def _run_react_agent(openai_client, session_id: str, user_text: str, max_steps: 
 
     final_text: Optional[str] = None
     for _ in range(max(1, max_steps)):
-        try:
-            response = openai_client.responses.create(
-                model=WHATSAPP_AGENT_MODEL,
-                input=messages,
-            )
-        except Exception as exc:
-            raise RuntimeError(f"OpenAI Responses API failed: {exc}")
-
-        assistant_text = ""
-        try:
-            output_text = getattr(response, "output_text", None)
-            if isinstance(output_text, str) and output_text.strip():
-                assistant_text = output_text.strip()
-        except Exception:
-            pass
-
+        response = _call_responses_api(messages)
+        assistant_text = _response_to_text(response)
         if not assistant_text:
-            try:
-                first_output = response.output[0]
-                first_content = first_output.content[0]
-                assistant_text = (getattr(first_content, "text", "") or "").strip()
-            except Exception:
-                assistant_text = str(response)
+            assistant_text = str(response)
 
         print(f"🤖 WhatsApp MCP agent response: {assistant_text[:200]}...")
         messages.append({"role": "assistant", "content": assistant_text})
@@ -246,6 +228,88 @@ def _run_react_agent(openai_client, session_id: str, user_text: str, max_steps: 
 
     messages.append({"role": "assistant", "content": final_text})
     return final_text
+
+
+def _call_responses_api(messages: List[Dict[str, Any]]) -> Any:
+    """
+    Call the OpenAI Responses API.
+    Falls back to a direct HTTP/1.1 requests call if the SDK hits a connection error
+    (commonly seen on Render with HTTP/2).
+    """
+    try:
+        return openai_client.responses.create(
+            model=WHATSAPP_AGENT_MODEL,
+            input=messages,
+        )
+    except Exception as exc:
+        error_text = str(exc)
+        if "Connection error" not in error_text and "ConnectionError" not in error_text:
+            raise RuntimeError(f"OpenAI Responses API failed: {exc}") from exc
+
+        print("⚠️  OpenAI SDK connection error; retrying with raw HTTP/1.1 request")
+        try:
+            resp = requests.post(
+                "https://api.openai.com/v1/responses",
+                headers={
+                    "Authorization": f"Bearer {Config.OPENAI_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": WHATSAPP_AGENT_MODEL,
+                    "input": messages,
+                },
+                timeout=60,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as http_exc:
+            raise RuntimeError(f"OpenAI Responses API failed after HTTP fallback: {http_exc}") from http_exc
+
+
+def _response_to_text(response: Any) -> str:
+    """Extract assistant text from either an OpenAI SDK object or raw JSON dict."""
+    if not response:
+        return ""
+
+    # Handle dict (raw JSON)
+    if isinstance(response, dict):
+        output_text = (response.get("output_text") or "").strip()
+        if output_text:
+            return output_text
+
+        output = response.get("output") or []
+        if output:
+            first = output[0]
+            if isinstance(first, dict):
+                content = first.get("content") or []
+                if content:
+                    first_content = content[0]
+                    if isinstance(first_content, dict):
+                        text = (first_content.get("text") or "").strip()
+                        if text:
+                            return text
+                    elif isinstance(first_content, str):
+                        return first_content.strip()
+        return ""
+
+    # Handle SDK object
+    try:
+        output_text = getattr(response, "output_text", None)
+        if isinstance(output_text, str) and output_text.strip():
+            return output_text.strip()
+    except Exception:
+        pass
+
+    try:
+        first_output = response.output[0]
+        first_content = first_output.content[0]
+        text = (getattr(first_content, "text", "") or "").strip()
+        if text:
+            return text
+    except Exception:
+        pass
+
+    return ""
 
 
 
