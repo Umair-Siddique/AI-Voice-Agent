@@ -9,6 +9,7 @@ gunicorn
 gevent
 fastmcp
 requests
+httpx
 SpeechRecognition==3.10.4 ; sys_platform == "win32"
 PyAudio==0.2.13 ; sys_platform == "win32"
 pyttsx3

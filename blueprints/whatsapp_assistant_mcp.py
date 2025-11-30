@@ -4,7 +4,7 @@ import json
 import asyncio
 from typing import Any, Dict, List, Optional
 
-import requests
+import httpx
 from flask import Blueprint, request, jsonify
 from fastmcp import Client as FastMCPClient
 from openai import OpenAI
@@ -13,9 +13,15 @@ from twilio.rest import Client
 from config import Config
 from utils import SYSTEM_MESSAGE
 
-# Initialize Twilio client
+# Initialize Twilio & OpenAI clients (force HTTP/1.1 to avoid Render HTTP/2 issues)
 twilio_client = Client(Config.TWILIO_ACCOUNT_SID, Config.TWILIO_AUTH_TOKEN)
-openai_client = OpenAI(api_key=Config.OPENAI_API_KEY)
+_httpx_client = httpx.Client(http2=False, timeout=60.0)
+openai_client = OpenAI(
+    api_key=Config.OPENAI_API_KEY,
+    http_client=_httpx_client,
+    timeout=60.0,
+    max_retries=2,
+)
 
 whatsapp_assistant_mcp_bp = Blueprint('whatsappmcp', __name__)
 
@@ -167,8 +173,16 @@ def _run_react_agent(openai_client, session_id: str, user_text: str, max_steps: 
     messages.append({"role": "user", "content": user_text})
 
     final_text: Optional[str] = None
-    for _ in range(max(1, max_steps)):
-        response = _call_responses_api(messages)
+    for step in range(max(1, max_steps)):
+        try:
+            response = openai_client.responses.create(
+                model=WHATSAPP_AGENT_MODEL,
+                input=messages,
+            )
+        except Exception as exc:
+            print(f"❌ OpenAI Responses API request failed at step {step + 1}: {exc}")
+            raise RuntimeError("OpenAI Responses API failed; check server logs for details.") from exc
+
         assistant_text = _response_to_text(response)
         if not assistant_text:
             assistant_text = str(response)
@@ -228,42 +242,6 @@ def _run_react_agent(openai_client, session_id: str, user_text: str, max_steps: 
 
     messages.append({"role": "assistant", "content": final_text})
     return final_text
-
-
-def _call_responses_api(messages: List[Dict[str, Any]]) -> Any:
-    """
-    Call the OpenAI Responses API.
-    Falls back to a direct HTTP/1.1 requests call if the SDK hits a connection error
-    (commonly seen on Render with HTTP/2).
-    """
-    try:
-        return openai_client.responses.create(
-            model=WHATSAPP_AGENT_MODEL,
-            input=messages,
-        )
-    except Exception as exc:
-        error_text = str(exc)
-        if "Connection error" not in error_text and "ConnectionError" not in error_text:
-            raise RuntimeError(f"OpenAI Responses API failed: {exc}") from exc
-
-        print("⚠️  OpenAI SDK connection error; retrying with raw HTTP/1.1 request")
-        try:
-            resp = requests.post(
-                "https://api.openai.com/v1/responses",
-                headers={
-                    "Authorization": f"Bearer {Config.OPENAI_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": WHATSAPP_AGENT_MODEL,
-                    "input": messages,
-                },
-                timeout=60,
-            )
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as http_exc:
-            raise RuntimeError(f"OpenAI Responses API failed after HTTP fallback: {http_exc}") from http_exc
 
 
 def _response_to_text(response: Any) -> str:
