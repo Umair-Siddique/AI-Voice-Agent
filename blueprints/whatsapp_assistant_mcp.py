@@ -174,16 +174,8 @@ def _run_react_agent(openai_client, session_id: str, user_text: str, max_steps: 
 
     final_text: Optional[str] = None
     for step in range(max(1, max_steps)):
-        try:
-            response = openai_client.responses.create(
-                model=WHATSAPP_AGENT_MODEL,
-                input=messages,
-            )
-        except Exception as exc:
-            print(f"❌ OpenAI Responses API request failed at step {step + 1}: {exc}")
-            raise RuntimeError("OpenAI Responses API failed; check server logs for details.") from exc
-
-        assistant_text = _response_to_text(response)
+        response = _call_chat_completion(messages, step)
+        assistant_text = _chat_response_to_text(response)
         if not assistant_text:
             assistant_text = str(response)
 
@@ -244,48 +236,55 @@ def _run_react_agent(openai_client, session_id: str, user_text: str, max_steps: 
     return final_text
 
 
-def _response_to_text(response: Any) -> str:
-    """Extract assistant text from either an OpenAI SDK object or raw JSON dict."""
+def _call_chat_completion(messages: List[Dict[str, Any]], step: int):
+    """Call the Chat Completions API (more stable on Render) and return the raw response."""
+    try:
+        return openai_client.chat.completions.create(
+            model=WHATSAPP_AGENT_MODEL,
+            messages=messages,
+            temperature=0.2,
+        )
+    except Exception as exc:
+        print(f"❌ OpenAI Chat Completions request failed at step {step + 1}: {exc}")
+        raise RuntimeError("OpenAI Chat Completions API failed; check server logs for details.") from exc
+
+
+def _chat_response_to_text(response: Any) -> str:
+    """Extract assistant text from a chat completion response (SDK object or dict)."""
     if not response:
         return ""
 
-    # Handle dict (raw JSON)
     if isinstance(response, dict):
-        output_text = (response.get("output_text") or "").strip()
-        if output_text:
-            return output_text
-
-        output = response.get("output") or []
-        if output:
-            first = output[0]
-            if isinstance(first, dict):
-                content = first.get("content") or []
-                if content:
-                    first_content = content[0]
-                    if isinstance(first_content, dict):
-                        text = (first_content.get("text") or "").strip()
-                        if text:
-                            return text
-                    elif isinstance(first_content, str):
-                        return first_content.strip()
+        choices = response.get("choices") or []
+        if not choices:
+            return ""
+        first_choice = choices[0] or {}
+        message = first_choice.get("message") or {}
+        content = message.get("content")
+        if isinstance(content, list):
+            # Some SDKs return list of content parts
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    text = (part.get("text") or "").strip()
+                    if text:
+                        return text
+        if isinstance(content, str):
+            return content.strip()
         return ""
 
-    # Handle SDK object
     try:
-        output_text = getattr(response, "output_text", None)
-        if isinstance(output_text, str) and output_text.strip():
-            return output_text.strip()
+        choice = response.choices[0]
+        message_content = getattr(choice.message, "content", "") or ""
+        if isinstance(message_content, str):
+            return message_content.strip()
+        if isinstance(message_content, list):
+            for part in message_content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    text = (part.get("text") or "").strip()
+                    if text:
+                        return text
     except Exception:
-        pass
-
-    try:
-        first_output = response.output[0]
-        first_content = first_output.content[0]
-        text = (getattr(first_content, "text", "") or "").strip()
-        if text:
-            return text
-    except Exception:
-        pass
+        return ""
 
     return ""
 
