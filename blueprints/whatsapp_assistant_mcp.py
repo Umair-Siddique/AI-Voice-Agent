@@ -4,8 +4,9 @@ import json
 import asyncio
 from typing import Any, Dict, List, Optional
 
-from flask import Blueprint, request, current_app, jsonify
+from flask import Blueprint, request, jsonify
 from fastmcp import Client as FastMCPClient
+from openai import OpenAI
 from twilio.rest import Client
 
 from config import Config
@@ -13,6 +14,7 @@ from utils import SYSTEM_MESSAGE
 
 # Initialize Twilio client
 twilio_client = Client(Config.TWILIO_ACCOUNT_SID, Config.TWILIO_AUTH_TOKEN)
+openai_client = OpenAI(api_key=Config.OPENAI_API_KEY)
 
 whatsapp_assistant_mcp_bp = Blueprint('whatsappmcp', __name__)
 
@@ -275,9 +277,6 @@ def handle_incoming_whatsapp():
         conversations[from_number] = [conversations[from_number][0]] + conversations[from_number][-10:]
     
     try:
-        # Get OpenAI client from app
-        openai_client = current_app.openai_client
-
         # Generate AI response using local ReAct agent (gpt-5 + MCP tools)
         ai_message = _run_react_agent(
             openai_client=openai_client,
