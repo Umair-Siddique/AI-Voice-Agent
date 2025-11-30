@@ -1,8 +1,8 @@
-from flask import Blueprint, request, current_app, Response, jsonify
+from flask import Blueprint, request, Response, jsonify
 from twilio.rest import Client
 from config import Config
 from utils import SYSTEM_MESSAGE
-from blueprints.mcp_server import _build_mcp_tools_spec
+from blueprints.mcp_server import _build_mcp_tools_spec, openai_client as mcp_openai_client
 
 # Initialize Twilio client
 twilio_client = Client(Config.TWILIO_ACCOUNT_SID, Config.TWILIO_AUTH_TOKEN)
@@ -42,9 +42,8 @@ def handle_incoming_whatsapp():
         conversations[from_number] = [conversations[from_number][0]] + conversations[from_number][-10:]
     
     try:
-        # Get OpenAI client from app
-        openai_client = current_app.openai_client
         messages = conversations[from_number]
+        openai_client = mcp_openai_client
         
         # Generate AI response with tool support (matching MCP server behavior)
         try:
@@ -52,16 +51,12 @@ def handle_incoming_whatsapp():
                 model="gpt-5",
                 input=messages,
                 tools=_build_mcp_tools_spec(),
-                max_output_tokens=200,
-                temperature=0.8,
             )
         except Exception as exc:
             print(f"⚠️  MCP tools call failed for WhatsApp assistant, falling back without tools: {exc}")
             response = openai_client.responses.create(
                 model="gpt-5",
                 input=messages,
-                max_output_tokens=200,
-                temperature=0.8,
             )
 
         ai_message = ""
