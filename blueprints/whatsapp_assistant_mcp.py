@@ -31,6 +31,10 @@ def call_openai_sync(messages: List[Dict[str, Any]]) -> str:
     Call OpenAI in a blocking manner. This will be run in a thread pool.
     Returns the assistant's text response.
     """
+    print(f"🔄 Calling OpenAI API...")
+    print(f"📊 Model: {WHATSAPP_AGENT_MODEL}")
+    print(f"📊 Messages count: {len(messages)}")
+    
     try:
         response = openai_client.chat.completions.create(
             model=WHATSAPP_AGENT_MODEL,
@@ -38,8 +42,13 @@ def call_openai_sync(messages: List[Dict[str, Any]]) -> str:
             temperature=0.7,
             max_tokens=500,
         )
-        return response.choices[0].message.content.strip()
+        result = response.choices[0].message.content.strip()
+        print(f"✅ OpenAI API call successful")
+        return result
     except Exception as exc:
+        print(f"❌ OpenAI API call failed: {exc}")
+        import traceback
+        traceback.print_exc()
         raise RuntimeError(f"OpenAI API call failed: {exc}")
 
 
@@ -76,12 +85,20 @@ def simple_react_loop(user_text: str, session_id: str, max_steps: int = 5) -> st
 def handle_incoming_whatsapp():
     """Handle incoming WhatsApp message and send AI-generated reply using Twilio SDK."""
     
+    print("=" * 80)
+    print("📥 INCOMING WHATSAPP WEBHOOK HIT")
+    print("=" * 80)
+    
     # Get the message from Twilio
     incoming_msg = request.values.get('Body', '').strip()
     from_number = request.values.get('From', '')  # This will be in format 'whatsapp:+1234567890'
     to_number = request.values.get('To', '')
     
-    print(f"Received WhatsApp from {from_number} to {to_number}: {incoming_msg}")
+    print(f"📱 From: {from_number}")
+    print(f"📱 To: {to_number}")
+    print(f"💬 Message: {incoming_msg}")
+    print(f"🔑 OPENAI_API_KEY present: {bool(Config.OPENAI_API_KEY)}")
+    print(f"🔑 TWILIO credentials present: {bool(Config.TWILIO_ACCOUNT_SID and Config.TWILIO_AUTH_TOKEN)}")
     
     # Get or create conversation history for this number
     if from_number not in conversations:
@@ -102,13 +119,17 @@ def handle_incoming_whatsapp():
     ai_message = None
     try:
         # Generate AI response using simple agent
-        print(f"🤖 Generating response for: {incoming_msg}")
+        print(f"🤖 Starting AI response generation...")
+        print(f"📊 Current conversation length: {len(conversations.get(from_number, []))}")
         
         ai_message = simple_react_loop(
             user_text=incoming_msg,
             session_id=from_number or "whatsapp_default",
             max_steps=WHATSAPP_AGENT_MAX_STEPS,
         )
+        
+        print(f"✅ AI Response generated successfully")
+        print(f"📝 Response: {ai_message[:200]}...")
         
         # Limit message length for WhatsApp (4096 chars max per message)
         if len(ai_message) > 4096:
@@ -120,21 +141,31 @@ def handle_incoming_whatsapp():
             "content": ai_message
         })
         
-        print(f"✅ AI Response generated: {ai_message[:100]}...")
+        print(f"💾 Response saved to conversation history")
         
     except Exception as e:
         print(f"❌ Error generating response: {e}")
+        import traceback
+        traceback.print_exc()
         ai_message = "Sorry, I'm having trouble processing your message right now. Please try again later."
     
     # Send WhatsApp message using Twilio SDK (do this regardless of AI success)
     try:
+        print(f"📤 Attempting to send WhatsApp message...")
+        print(f"📤 From: {Config.TWILIO_WHATSAPP_NUMBER}")
+        print(f"📤 To: {from_number}")
+        print(f"📤 Body length: {len(ai_message)} chars")
+        
         message = twilio_client.messages.create(
             body=ai_message,
             from_=Config.TWILIO_WHATSAPP_NUMBER,
             to=from_number  # from_number already has 'whatsapp:' prefix
         )
         
-        print(f"📤 WhatsApp message sent! SID: {message.sid}, Status: {message.status}")
+        print(f"✅ WhatsApp message sent successfully!")
+        print(f"📋 SID: {message.sid}")
+        print(f"📊 Status: {message.status}")
+        print("=" * 80)
         
         return jsonify({
             "success": True,
@@ -144,6 +175,9 @@ def handle_incoming_whatsapp():
         
     except Exception as e:
         print(f"❌ Failed to send WhatsApp message: {e}")
+        import traceback
+        traceback.print_exc()
+        print("=" * 80)
         return jsonify({"success": False, "error": str(e)}), 500
 
 
