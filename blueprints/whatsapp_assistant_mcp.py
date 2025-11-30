@@ -1,11 +1,8 @@
 import os
-import json
-from typing import Any, Dict, List, Optional
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
-
 from flask import Blueprint, request, jsonify
 from twilio.rest import Client
 from openai import OpenAI
+from threading import Thread
 
 from config import Config
 from utils import SYSTEM_MESSAGE
@@ -19,166 +16,129 @@ whatsapp_assistant_mcp_bp = Blueprint('whatsappmcp', __name__)
 # Simple in-memory conversation storage (for production, use a database)
 conversations = {}
 
-# Thread pool for running blocking OpenAI calls outside gevent
-executor = ThreadPoolExecutor(max_workers=5)
-
-WHATSAPP_AGENT_MAX_STEPS = int(os.getenv("WHATSAPP_AGENT_MAX_STEPS", "5"))
-WHATSAPP_AGENT_MODEL = os.getenv("WHATSAPP_AGENT_MODEL", "gpt-4o")  # Fallback to gpt-4o since gpt-5 might not be available
+WHATSAPP_AGENT_MODEL = os.getenv("WHATSAPP_AGENT_MODEL", "gpt-4o")
 
 
-def call_openai_sync(messages: List[Dict[str, Any]]) -> str:
+def process_and_respond(from_number: str, to_number: str, incoming_msg: str):
     """
-    Call OpenAI in a blocking manner. This will be run in a thread pool.
-    Returns the assistant's text response.
+    Process the message and send response in a background thread.
+    This runs AFTER we've already responded to Twilio with 200 OK.
     """
-    print(f"🔄 Calling OpenAI API...")
-    print(f"📊 Model: {WHATSAPP_AGENT_MODEL}")
-    print(f"📊 Messages count: {len(messages)}")
-    
     try:
+        print("=" * 80)
+        print(f"🔄 Background processing started")
+        print(f"📱 From: {from_number}")
+        print(f"💬 Message: {incoming_msg}")
+        print("=" * 80)
+        
+        # Get or create conversation history
+        if from_number not in conversations:
+            conversations[from_number] = [
+                {"role": "system", "content": SYSTEM_MESSAGE}
+            ]
+        
+        # Add user message
+        conversations[from_number].append({
+            "role": "user",
+            "content": incoming_msg
+        })
+        
+        # Keep only last 10 messages
+        if len(conversations[from_number]) > 11:
+            conversations[from_number] = [conversations[from_number][0]] + conversations[from_number][-10:]
+        
+        print(f"🤖 Calling OpenAI API...")
+        
+        # Call OpenAI
         response = openai_client.chat.completions.create(
             model=WHATSAPP_AGENT_MODEL,
-            messages=messages,
+            messages=conversations[from_number],
             temperature=0.7,
             max_tokens=500,
-        )
-        result = response.choices[0].message.content.strip()
-        print(f"✅ OpenAI API call successful")
-        return result
-    except Exception as exc:
-        print(f"❌ OpenAI API call failed: {exc}")
-        import traceback
-        traceback.print_exc()
-        raise RuntimeError(f"OpenAI API call failed: {exc}")
-
-
-def simple_react_loop(user_text: str, session_id: str, max_steps: int = 5) -> str:
-    """
-    Simplified ReAct loop without MCP tools for now.
-    Just returns a conversational response.
-    """
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are a helpful AI assistant. "
-                "Respond naturally to user queries about services, appointments, or general questions. "
-                "Be concise and friendly."
-            )
-        },
-        {"role": "user", "content": user_text}
-    ]
-    
-    try:
-        # Run in thread pool to avoid gevent issues
-        future = executor.submit(call_openai_sync, messages)
-        response = future.result(timeout=60)  # 60 second timeout
-        return response
-    except FuturesTimeoutError:
-        return "Sorry, the request took too long. Please try again."
-    except Exception as exc:
-        print(f"Error in ReAct loop: {exc}")
-        return "Sorry, I encountered an error processing your request."
-
-
-@whatsapp_assistant_mcp_bp.route("/incoming-whatsapp", methods=["POST"])
-def handle_incoming_whatsapp():
-    """Handle incoming WhatsApp message and send AI-generated reply using Twilio SDK."""
-    
-    print("=" * 80)
-    print("📥 INCOMING WHATSAPP WEBHOOK HIT")
-    print("=" * 80)
-    
-    # Get the message from Twilio
-    incoming_msg = request.values.get('Body', '').strip()
-    from_number = request.values.get('From', '')  # This will be in format 'whatsapp:+1234567890'
-    to_number = request.values.get('To', '')
-    
-    print(f"📱 From: {from_number}")
-    print(f"📱 To: {to_number}")
-    print(f"💬 Message: {incoming_msg}")
-    print(f"🔑 OPENAI_API_KEY present: {bool(Config.OPENAI_API_KEY)}")
-    print(f"🔑 TWILIO credentials present: {bool(Config.TWILIO_ACCOUNT_SID and Config.TWILIO_AUTH_TOKEN)}")
-    
-    # Get or create conversation history for this number
-    if from_number not in conversations:
-        conversations[from_number] = [
-            {"role": "system", "content": SYSTEM_MESSAGE}
-        ]
-    
-    # Add user message to conversation history
-    conversations[from_number].append({
-        "role": "user",
-        "content": incoming_msg
-    })
-    
-    # Keep only last 10 messages to avoid token limits
-    if len(conversations[from_number]) > 11:  # 1 system + 10 messages
-        conversations[from_number] = [conversations[from_number][0]] + conversations[from_number][-10:]
-    
-    ai_message = None
-    try:
-        # Generate AI response using simple agent
-        print(f"🤖 Starting AI response generation...")
-        print(f"📊 Current conversation length: {len(conversations.get(from_number, []))}")
-        
-        ai_message = simple_react_loop(
-            user_text=incoming_msg,
-            session_id=from_number or "whatsapp_default",
-            max_steps=WHATSAPP_AGENT_MAX_STEPS,
+            timeout=30,
         )
         
-        print(f"✅ AI Response generated successfully")
-        print(f"📝 Response: {ai_message[:200]}...")
+        ai_message = response.choices[0].message.content.strip()
         
-        # Limit message length for WhatsApp (4096 chars max per message)
+        print(f"✅ OpenAI response received: {ai_message[:100]}...")
+        
+        # Limit message length for WhatsApp
         if len(ai_message) > 4096:
             ai_message = ai_message[:4093] + "..."
         
-        # Add assistant response to conversation history
+        # Add to conversation history
         conversations[from_number].append({
             "role": "assistant",
             "content": ai_message
         })
         
-        print(f"💾 Response saved to conversation history")
+        print(f"📤 Sending WhatsApp reply...")
         
-    except Exception as e:
-        print(f"❌ Error generating response: {e}")
-        import traceback
-        traceback.print_exc()
-        ai_message = "Sorry, I'm having trouble processing your message right now. Please try again later."
-    
-    # Send WhatsApp message using Twilio SDK (do this regardless of AI success)
-    try:
-        print(f"📤 Attempting to send WhatsApp message...")
-        print(f"📤 From: {Config.TWILIO_WHATSAPP_NUMBER}")
-        print(f"📤 To: {from_number}")
-        print(f"📤 Body length: {len(ai_message)} chars")
-        
+        # Send WhatsApp message
         message = twilio_client.messages.create(
             body=ai_message,
             from_=Config.TWILIO_WHATSAPP_NUMBER,
-            to=from_number  # from_number already has 'whatsapp:' prefix
+            to=from_number
         )
         
-        print(f"✅ WhatsApp message sent successfully!")
-        print(f"📋 SID: {message.sid}")
-        print(f"📊 Status: {message.status}")
+        print(f"✅ WhatsApp sent! SID: {message.sid}, Status: {message.status}")
         print("=" * 80)
-        
-        return jsonify({
-            "success": True,
-            "message_sid": message.sid,
-            "status": message.status
-        }), 200
         
     except Exception as e:
-        print(f"❌ Failed to send WhatsApp message: {e}")
+        print(f"❌ Error in background processing: {e}")
         import traceback
         traceback.print_exc()
+        
+        # Try to send error message
+        try:
+            twilio_client.messages.create(
+                body="Sorry, I'm having trouble processing your message. Please try again.",
+                from_=Config.TWILIO_WHATSAPP_NUMBER,
+                to=from_number
+            )
+        except Exception as send_error:
+            print(f"❌ Failed to send error message: {send_error}")
+        
         print("=" * 80)
-        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@whatsapp_assistant_mcp_bp.route("/incoming-whatsapp", methods=["POST"])
+def handle_incoming_whatsapp():
+    """
+    Handle incoming WhatsApp message.
+    Responds immediately to Twilio, then processes message in background.
+    """
+    print("=" * 80)
+    print("📥 WEBHOOK HIT - Responding immediately to Twilio")
+    print("=" * 80)
+    
+    # Get the message from Twilio
+    incoming_msg = request.values.get('Body', '').strip()
+    from_number = request.values.get('From', '')
+    to_number = request.values.get('To', '')
+    
+    print(f"📱 From: {from_number}")
+    print(f"📱 To: {to_number}")
+    print(f"💬 Message: {incoming_msg}")
+    
+    if not incoming_msg or not from_number:
+        print("❌ Missing required fields")
+        return jsonify({"success": False, "error": "Missing Body or From"}), 400
+    
+    # Start background thread to process and respond
+    thread = Thread(
+        target=process_and_respond,
+        args=(from_number, to_number, incoming_msg),
+        daemon=True
+    )
+    thread.start()
+    
+    print("🚀 Background thread started, responding 200 OK to Twilio")
+    print("=" * 80)
+    
+    # Respond immediately to Twilio with 200 OK
+    # This prevents the 15-second timeout
+    return jsonify({"success": True, "status": "processing"}), 200
 
 
 @whatsapp_assistant_mcp_bp.route("/clear-conversation", methods=["POST"])
