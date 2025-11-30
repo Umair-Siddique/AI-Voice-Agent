@@ -1,29 +1,75 @@
 import os
-import requests
+import json
+from typing import Any, Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+
 from flask import Blueprint, request, jsonify
 from twilio.rest import Client
+from openai import OpenAI
 
 from config import Config
 from utils import SYSTEM_MESSAGE
 
-# Initialize Twilio client
+# Initialize Twilio and OpenAI clients
 twilio_client = Client(Config.TWILIO_ACCOUNT_SID, Config.TWILIO_AUTH_TOKEN)
+openai_client = OpenAI(api_key=Config.OPENAI_API_KEY)
 
 whatsapp_assistant_mcp_bp = Blueprint('whatsappmcp', __name__)
 
 # Simple in-memory conversation storage (for production, use a database)
 conversations = {}
 
-# MCP server configuration
-WHATSAPP_AGENT_MAX_STEPS = int(
-    os.getenv("WHATSAPP_AGENT_MAX_STEPS", os.getenv("AGENT_MAX_STEPS", "15"))
-)
+# Thread pool for running blocking OpenAI calls outside gevent
+executor = ThreadPoolExecutor(max_workers=5)
 
-# Internal MCP ReAct endpoint (your existing /mcp/react that works locally)
-INTERNAL_MCP_ENDPOINT = os.getenv(
-    "INTERNAL_MCP_ENDPOINT",
-    "http://localhost:5000/mcp/react"  # On Render, set this to https://ai-voice-agent-wt2m.onrender.com/mcp/react
-)
+WHATSAPP_AGENT_MAX_STEPS = int(os.getenv("WHATSAPP_AGENT_MAX_STEPS", "5"))
+WHATSAPP_AGENT_MODEL = os.getenv("WHATSAPP_AGENT_MODEL", "gpt-4o")  # Fallback to gpt-4o since gpt-5 might not be available
+
+
+def call_openai_sync(messages: List[Dict[str, Any]]) -> str:
+    """
+    Call OpenAI in a blocking manner. This will be run in a thread pool.
+    Returns the assistant's text response.
+    """
+    try:
+        response = openai_client.chat.completions.create(
+            model=WHATSAPP_AGENT_MODEL,
+            messages=messages,
+            temperature=0.7,
+            max_tokens=500,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as exc:
+        raise RuntimeError(f"OpenAI API call failed: {exc}")
+
+
+def simple_react_loop(user_text: str, session_id: str, max_steps: int = 5) -> str:
+    """
+    Simplified ReAct loop without MCP tools for now.
+    Just returns a conversational response.
+    """
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a helpful AI assistant. "
+                "Respond naturally to user queries about services, appointments, or general questions. "
+                "Be concise and friendly."
+            )
+        },
+        {"role": "user", "content": user_text}
+    ]
+    
+    try:
+        # Run in thread pool to avoid gevent issues
+        future = executor.submit(call_openai_sync, messages)
+        response = future.result(timeout=60)  # 60 second timeout
+        return response
+    except FuturesTimeoutError:
+        return "Sorry, the request took too long. Please try again."
+    except Exception as exc:
+        print(f"Error in ReAct loop: {exc}")
+        return "Sorry, I encountered an error processing your request."
 
 
 @whatsapp_assistant_mcp_bp.route("/incoming-whatsapp", methods=["POST"])
@@ -53,26 +99,16 @@ def handle_incoming_whatsapp():
     if len(conversations[from_number]) > 11:  # 1 system + 10 messages
         conversations[from_number] = [conversations[from_number][0]] + conversations[from_number][-10:]
     
+    ai_message = None
     try:
-        # Call the internal MCP ReAct endpoint (which already works locally)
-        print(f"🔄 Proxying to internal MCP endpoint: {INTERNAL_MCP_ENDPOINT}")
+        # Generate AI response using simple agent
+        print(f"🤖 Generating response for: {incoming_msg}")
         
-        response = requests.post(
-            INTERNAL_MCP_ENDPOINT,
-            json={
-                "text": incoming_msg,
-                "session_id": from_number or "whatsapp_default",
-                "max_steps": WHATSAPP_AGENT_MAX_STEPS,
-            },
-            timeout=120,  # Give MCP tools enough time
+        ai_message = simple_react_loop(
+            user_text=incoming_msg,
+            session_id=from_number or "whatsapp_default",
+            max_steps=WHATSAPP_AGENT_MAX_STEPS,
         )
-        response.raise_for_status()
-        
-        result = response.json()
-        if not result.get("success"):
-            raise Exception(f"MCP endpoint returned error: {result.get('error', 'Unknown error')}")
-        
-        ai_message = result.get("response", "Sorry, I couldn't process that.")
         
         # Limit message length for WhatsApp (4096 chars max per message)
         if len(ai_message) > 4096:
@@ -84,17 +120,21 @@ def handle_incoming_whatsapp():
             "content": ai_message
         })
         
-        print(f"AI Response to {from_number}: {ai_message}")
+        print(f"✅ AI Response generated: {ai_message[:100]}...")
         
-        # Send WhatsApp message using Twilio SDK
-        # Note: from_number already includes 'whatsapp:' prefix from Twilio
+    except Exception as e:
+        print(f"❌ Error generating response: {e}")
+        ai_message = "Sorry, I'm having trouble processing your message right now. Please try again later."
+    
+    # Send WhatsApp message using Twilio SDK (do this regardless of AI success)
+    try:
         message = twilio_client.messages.create(
             body=ai_message,
             from_=Config.TWILIO_WHATSAPP_NUMBER,
             to=from_number  # from_number already has 'whatsapp:' prefix
         )
         
-        print(f"WhatsApp message sent successfully! SID: {message.sid}, Status: {message.status}")
+        print(f"📤 WhatsApp message sent! SID: {message.sid}, Status: {message.status}")
         
         return jsonify({
             "success": True,
@@ -103,23 +143,8 @@ def handle_incoming_whatsapp():
         }), 200
         
     except Exception as e:
-        error_msg = str(e)
-        print(f"Error: {error_msg}")
-        
-        # Send simple error message (don't try to be fancy to avoid recursion)
-        simple_error = "Sorry, I'm having trouble right now. Please try again later."
-        
-        try:
-            error_message = twilio_client.messages.create(
-                body=simple_error,
-                from_=Config.TWILIO_WHATSAPP_NUMBER,
-                to=from_number
-            )
-            print(f"Error message sent. SID: {error_message.sid}")
-        except Exception as send_error:
-            print(f"Failed to send error message: {send_error}")
-        
-        return jsonify({"success": False, "error": error_msg}), 500
+        print(f"❌ Failed to send WhatsApp message: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 @whatsapp_assistant_mcp_bp.route("/clear-conversation", methods=["POST"])
@@ -133,14 +158,6 @@ def clear_conversation():
     
     if from_number in conversations:
         del conversations[from_number]
-        
-        # Also clear the MCP ReAct session by calling the internal endpoint
-        try:
-            # You'd need to add a clear endpoint to mcp_server.py if you want this
-            pass
-        except Exception:
-            pass
-        
         return {"message": f"Conversation cleared for {from_number}"}, 200
     
     return {"message": "No conversation found for this number"}, 404
@@ -166,7 +183,7 @@ def test_whatsapp():
     try:
         # Send simple test message using Twilio SDK
         message = twilio_client.messages.create(
-            body="Hello! This is a test response from your AI WhatsApp assistant with MCP tools.",
+            body="Hello! This is a test response from your AI WhatsApp assistant.",
             from_=Config.TWILIO_WHATSAPP_NUMBER,
             to=from_number
         )
