@@ -1,15 +1,14 @@
 import os
-from flask import Blueprint, request, jsonify
+import requests
+from flask import Blueprint, request, Response, jsonify
 from twilio.rest import Client
-from openai import OpenAI
 from threading import Thread
 
 from config import Config
 from utils import SYSTEM_MESSAGE
 
-# Initialize Twilio and OpenAI clients
+# Initialize Twilio client
 twilio_client = Client(Config.TWILIO_ACCOUNT_SID, Config.TWILIO_AUTH_TOKEN)
-openai_client = OpenAI(api_key=Config.OPENAI_API_KEY)
 
 whatsapp_assistant_mcp_bp = Blueprint('whatsappmcp', __name__)
 
@@ -17,6 +16,33 @@ whatsapp_assistant_mcp_bp = Blueprint('whatsappmcp', __name__)
 conversations = {}
 
 WHATSAPP_AGENT_MODEL = os.getenv("WHATSAPP_AGENT_MODEL", "gpt-4o")
+
+
+def call_openai_via_api(messages: list) -> str:
+    """
+    Call OpenAI API using raw requests instead of the SDK.
+    This avoids the SSL/gevent issues we're seeing with the OpenAI SDK.
+    """
+    try:
+        response = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {Config.OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": WHATSAPP_AGENT_MODEL,
+                "messages": messages,
+                "temperature": 0.7,
+                "max_tokens": 500,
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        result = response.json()
+        return result["choices"][0]["message"]["content"].strip()
+    except Exception as exc:
+        raise RuntimeError(f"OpenAI API call failed: {exc}")
 
 
 def process_and_respond(from_number: str, to_number: str, incoming_msg: str):
@@ -49,16 +75,8 @@ def process_and_respond(from_number: str, to_number: str, incoming_msg: str):
         
         print(f"🤖 Calling OpenAI API...")
         
-        # Call OpenAI
-        response = openai_client.chat.completions.create(
-            model=WHATSAPP_AGENT_MODEL,
-            messages=conversations[from_number],
-            temperature=0.7,
-            max_tokens=500,
-            timeout=30,
-        )
-        
-        ai_message = response.choices[0].message.content.strip()
+        # Call OpenAI using raw requests (avoids SDK SSL/gevent issues)
+        ai_message = call_openai_via_api(conversations[from_number])
         
         print(f"✅ OpenAI response received: {ai_message[:100]}...")
         
@@ -136,9 +154,10 @@ def handle_incoming_whatsapp():
     print("🚀 Background thread started, responding 200 OK to Twilio")
     print("=" * 80)
     
-    # Respond immediately to Twilio with 200 OK
-    # This prevents the 15-second timeout
-    return jsonify({"success": True, "status": "processing"}), 200
+    # Respond immediately to Twilio with empty 200 OK
+    # For WhatsApp/SMS, Twilio expects either empty response or TwiML
+    # This prevents the 15-second timeout and Content-Type errors
+    return Response("", status=200, mimetype='text/plain')
 
 
 @whatsapp_assistant_mcp_bp.route("/clear-conversation", methods=["POST"])
@@ -152,16 +171,16 @@ def clear_conversation():
     
     if from_number in conversations:
         del conversations[from_number]
-        return {"message": f"Conversation cleared for {from_number}"}, 200
+        return jsonify({"message": f"Conversation cleared for {from_number}"}), 200
     
-    return {"message": "No conversation found for this number"}, 404
+    return jsonify({"message": "No conversation found for this number"}), 404
 
 
 @whatsapp_assistant_mcp_bp.route("/clear-all-conversations", methods=["POST"])
 def clear_all_conversations():
     """Clear all conversation histories."""
     conversations.clear()
-    return {"message": "All conversations cleared"}, 200
+    return jsonify({"message": "All conversations cleared"}), 200
 
 
 @whatsapp_assistant_mcp_bp.route("/test-whatsapp", methods=["POST"])
