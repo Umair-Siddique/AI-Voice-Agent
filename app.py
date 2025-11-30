@@ -35,7 +35,7 @@ def create_app():
     app.register_blueprint(voice_assistant_bp, url_prefix="/voice")
     app.register_blueprint(sms_assistant_bp, url_prefix="/sms")
     app.register_blueprint(whatsapp_assistant_bp, url_prefix="/whatsapp")
-    app.register.blueprints(whatsapp_assistant_mcp,url_prefix="/whatsappmcp")
+    app.register_blueprint(whatsapp_assistant_mcp, url_prefix="/whatsappmcp")
     app.register_blueprint(mcp_bp, url_prefix="/mcp")
     app.register_blueprint(voice_mcp_bp,url_prefix="/voicemcp")
 
