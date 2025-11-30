@@ -1,293 +1,29 @@
 import os
-import re
-import json
-import asyncio
-from typing import Any, Dict, List, Optional
-
-import httpx
+import requests
 from flask import Blueprint, request, jsonify
-from fastmcp import Client as FastMCPClient
-from openai import OpenAI
 from twilio.rest import Client
 
 from config import Config
 from utils import SYSTEM_MESSAGE
 
-# Initialize Twilio & OpenAI clients (force HTTP/1.1 to avoid Render HTTP/2 issues)
+# Initialize Twilio client
 twilio_client = Client(Config.TWILIO_ACCOUNT_SID, Config.TWILIO_AUTH_TOKEN)
-_httpx_client = httpx.Client(http2=False, timeout=60.0)
-openai_client = OpenAI(
-    api_key=Config.OPENAI_API_KEY,
-    http_client=_httpx_client,
-    timeout=60.0,
-    max_retries=2,
-)
 
 whatsapp_assistant_mcp_bp = Blueprint('whatsappmcp', __name__)
 
 # Simple in-memory conversation storage (for production, use a database)
 conversations = {}
 
-agent_conversations: Dict[str, List[Dict[str, Any]]] = {}
-agent_cached_tool_schemas: Dict[str, Dict[str, Any]] = {}
-
-SIMPLYBOOK_MCP_URL = os.getenv(
-    "SIMPLYBOOK_MCP_URL",
-    "https://simplybook-mcp-server.onrender.com/sse"
-)
+# MCP server configuration
 WHATSAPP_AGENT_MAX_STEPS = int(
     os.getenv("WHATSAPP_AGENT_MAX_STEPS", os.getenv("AGENT_MAX_STEPS", "15"))
 )
-WHATSAPP_AGENT_MODEL = os.getenv("WHATSAPP_AGENT_MODEL", "gpt-5")
 
-
-def _safe_to_string(value: Any) -> str:
-    try:
-        if isinstance(value, (dict, list)):
-            return json.dumps(value, ensure_ascii=False)
-        return str(value)
-    except Exception:
-        try:
-            return repr(value)
-        except Exception:
-            return "<unserializable>"
-
-
-async def _mcp_call(tool_name: str, arguments: Dict[str, Any]) -> str:
-    """Call a remote MCP tool via FastMCP and return a printable result string."""
-    mcp_url = SIMPLYBOOK_MCP_URL.rstrip("/")
-    try:
-        client = FastMCPClient(mcp_url)
-        async with client:
-            await asyncio.sleep(0.5)  # Give the SSE connection time to settle
-            result = await client.call_tool(tool_name, arguments or {})
-            data = getattr(result, "data", result)
-            return _safe_to_string(data)
-    except Exception as exc:
-        raise Exception(f"MCP call failed for '{tool_name}': {exc}")
-
-
-async def _mcp_tools_brief(limit: int = 24) -> str:
-    """Return a short markdown list of available MCP tools."""
-    mcp_url = SIMPLYBOOK_MCP_URL.rstrip("/")
-    client = FastMCPClient(mcp_url)
-    lines: List[str] = []
-    async with client:
-        await asyncio.sleep(0.5)
-        tools = await client.list_tools()
-        for idx, tool in enumerate(tools):
-            if idx >= limit:
-                lines.append(f"- ... and {len(tools) - limit} more")
-                break
-            name = getattr(tool, "name", "unknown_tool")
-            description = getattr(tool, "description", "") or ""
-            lines.append(f"- {name}: {description}")
-    return "\n".join(lines) if lines else "- (no tools discovered)"
-
-
-def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
-    """Extract the first JSON object from arbitrary text."""
-    if not text:
-        return None
-
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-
-    fenced = re.search(r"```json\s*(\{[\s\S]*?\})\s*```", text, re.IGNORECASE)
-
-    if fenced:
-        try:
-            return json.loads(fenced.group(1))
-        except Exception:
-            pass
-
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        candidate = text[start : end + 1]
-        try:
-            return json.loads(candidate)
-        except Exception:
-            return None
-
-    return None
-
-
-async def _fetch_tool_schema(tool_name: str) -> Optional[Dict[str, Any]]:
-    """Fetch and cache the schema for a given tool from the MCP server."""
-    if tool_name in agent_cached_tool_schemas:
-        return agent_cached_tool_schemas[tool_name]
-
-    mcp_url = SIMPLYBOOK_MCP_URL.rstrip("/")
-    client = FastMCPClient(mcp_url)
-    async with client:
-        await asyncio.sleep(0.3)
-        tools = await client.list_tools()
-        for tool in tools:
-            if getattr(tool, "name", None) == tool_name:
-                schema = getattr(tool, "inputSchema", None) or getattr(tool, "schema", None)
-                if isinstance(schema, dict):
-                    agent_cached_tool_schemas[tool_name] = schema
-                    return schema
-    return None
-
-
-def _prime_agent_session(session_id: str) -> List[Dict[str, Any]]:
-    """Ensure a ReAct session exists with the required system prompt."""
-    if session_id in agent_conversations:
-        return agent_conversations[session_id]
-
-    try:
-        tools_list = asyncio.run(_mcp_tools_brief())
-        print(f"✅ Discovered MCP tools for WhatsApp session {session_id}")
-    except Exception as exc:
-        tools_list = f"- (failed to load tools: {exc})"
-        print(f"❌ Could not discover MCP tools: {exc}")
-
-    system_prompt = (
-        "You are a WhatsApp AI agent that uses a SimplyBook MCP server to achieve goals. "
-        "Employ the ReAct loop: think -> act -> observe -> repeat, then share a final answer.\n\n"
-        "Available tools:\n"
-        f"{tools_list}\n\n"
-        "Scheduling guardrails:\n"
-        "- Never assume which appointment should change; confirm with the user.\n"
-        "- When multiple matches exist, list them and ask the user to choose.\n"
-        "- Repeat the client and appointment details before booking, rescheduling, or cancelling.\n\n"
-        "RESPONSE FORMAT (STRICT):\n"
-        "• Tool call:\n"
-        '{ "thought": "<brief reason>", "action": "<tool_name>", "action_input": { ... } }\n'
-        "• Final answer:\n"
-        '{ "final": "<natural language reply>" }\n'
-        "Always return exactly one JSON object without extra narration."
-    )
-
-    agent_conversations[session_id] = [{"role": "system", "content": system_prompt}]
-    return agent_conversations[session_id]
-
-
-def _run_react_agent(openai_client, session_id: str, user_text: str, max_steps: int) -> str:
-    """Run the ReAct loop to obtain a final answer capable of calling MCP tools."""
-    messages = _prime_agent_session(session_id)
-    messages.append({"role": "user", "content": user_text})
-
-    final_text: Optional[str] = None
-    for step in range(max(1, max_steps)):
-        response = _call_chat_completion(messages, step)
-        assistant_text = _chat_response_to_text(response)
-        if not assistant_text:
-            assistant_text = str(response)
-
-        print(f"🤖 WhatsApp MCP agent response: {assistant_text[:200]}...")
-        messages.append({"role": "assistant", "content": assistant_text})
-
-        control = _extract_json_object(assistant_text)
-        if not control:
-            print("⚠️ Model returned non-JSON control; reinforcing protocol.")
-            messages.append({
-                "role": "user",
-                "content": (
-                    "Follow the JSON-only protocol. Either call a tool:\n"
-                    '{ "thought": "...", "action": "<tool_name>", "action_input": { ... } }\n'
-                    "or provide the final answer:\n"
-                    '{ "final": "<answer>" }'
-                ),
-            })
-            continue
-
-        if control.get("final"):
-            final_text = str(control["final"]).strip()
-            break
-
-        action = control.get("action")
-        action_input = control.get("action_input") or {}
-        if not action:
-            final_text = assistant_text
-            break
-
-        try:
-            print(f"🔧 Invoking MCP tool '{action}' with args {action_input}")
-            observation = asyncio.run(_mcp_call(action, action_input))
-            print(f"✅ Tool '{action}' returned: {observation[:200]}...")
-        except Exception as exc:
-            error_msg = f"Tool error calling '{action}': {exc}"
-            print(f"❌ {error_msg}")
-            try:
-                tool_schema = asyncio.run(_fetch_tool_schema(action))
-            except Exception as schema_exc:
-                tool_schema = None
-                print(f"⚠️ Failed to fetch schema for '{action}': {schema_exc}")
-            schema_hint = f"\n\nInput schema for '{action}':\n{json.dumps(tool_schema, indent=2)}" if tool_schema else ""
-            observation = error_msg + schema_hint
-
-        messages.append({
-            "role": "user",
-            "content": f"Tool '{action}' returned: {observation}",
-        })
-
-    if not final_text:
-        final_text = (
-            "I stopped before reaching a final answer because the step limit was hit. "
-            "Share any missing appointment details and I'll try again."
-        )
-
-    messages.append({"role": "assistant", "content": final_text})
-    return final_text
-
-
-def _call_chat_completion(messages: List[Dict[str, Any]], step: int):
-    """Call the Chat Completions API (more stable on Render) and return the raw response."""
-    try:
-        return openai_client.chat.completions.create(
-            model=WHATSAPP_AGENT_MODEL,
-            messages=messages,
-            temperature=0.2,
-        )
-    except Exception as exc:
-        print(f"❌ OpenAI Chat Completions request failed at step {step + 1}: {exc}")
-        raise RuntimeError("OpenAI Chat Completions API failed; check server logs for details.") from exc
-
-
-def _chat_response_to_text(response: Any) -> str:
-    """Extract assistant text from a chat completion response (SDK object or dict)."""
-    if not response:
-        return ""
-
-    if isinstance(response, dict):
-        choices = response.get("choices") or []
-        if not choices:
-            return ""
-        first_choice = choices[0] or {}
-        message = first_choice.get("message") or {}
-        content = message.get("content")
-        if isinstance(content, list):
-            # Some SDKs return list of content parts
-            for part in content:
-                if isinstance(part, dict) and part.get("type") == "text":
-                    text = (part.get("text") or "").strip()
-                    if text:
-                        return text
-        if isinstance(content, str):
-            return content.strip()
-        return ""
-
-    try:
-        choice = response.choices[0]
-        message_content = getattr(choice.message, "content", "") or ""
-        if isinstance(message_content, str):
-            return message_content.strip()
-        if isinstance(message_content, list):
-            for part in message_content:
-                if isinstance(part, dict) and part.get("type") == "text":
-                    text = (part.get("text") or "").strip()
-                    if text:
-                        return text
-    except Exception:
-        return ""
-
-    return ""
-
+# Internal MCP ReAct endpoint (your existing /mcp/react that works locally)
+INTERNAL_MCP_ENDPOINT = os.getenv(
+    "INTERNAL_MCP_ENDPOINT",
+    "http://localhost:5000/mcp/react"  # On Render, set this to https://ai-voice-agent-wt2m.onrender.com/mcp/react
+)
 
 
 @whatsapp_assistant_mcp_bp.route("/incoming-whatsapp", methods=["POST"])
@@ -318,13 +54,25 @@ def handle_incoming_whatsapp():
         conversations[from_number] = [conversations[from_number][0]] + conversations[from_number][-10:]
     
     try:
-        # Generate AI response using local ReAct agent (gpt-5 + MCP tools)
-        ai_message = _run_react_agent(
-            openai_client=openai_client,
-            session_id=from_number or "whatsapp_default",
-            user_text=incoming_msg,
-            max_steps=WHATSAPP_AGENT_MAX_STEPS,
+        # Call the internal MCP ReAct endpoint (which already works locally)
+        print(f"🔄 Proxying to internal MCP endpoint: {INTERNAL_MCP_ENDPOINT}")
+        
+        response = requests.post(
+            INTERNAL_MCP_ENDPOINT,
+            json={
+                "text": incoming_msg,
+                "session_id": from_number or "whatsapp_default",
+                "max_steps": WHATSAPP_AGENT_MAX_STEPS,
+            },
+            timeout=120,  # Give MCP tools enough time
         )
+        response.raise_for_status()
+        
+        result = response.json()
+        if not result.get("success"):
+            raise Exception(f"MCP endpoint returned error: {result.get('error', 'Unknown error')}")
+        
+        ai_message = result.get("response", "Sorry, I couldn't process that.")
         
         # Limit message length for WhatsApp (4096 chars max per message)
         if len(ai_message) > 4096:
@@ -355,12 +103,15 @@ def handle_incoming_whatsapp():
         }), 200
         
     except Exception as e:
-        print(f"Error: {e}")
+        error_msg = str(e)
+        print(f"Error: {error_msg}")
         
-        # Try to send error message
+        # Send simple error message (don't try to be fancy to avoid recursion)
+        simple_error = "Sorry, I'm having trouble right now. Please try again later."
+        
         try:
             error_message = twilio_client.messages.create(
-                body="Sorry, I'm having trouble processing your message right now. Please try again later.",
+                body=simple_error,
                 from_=Config.TWILIO_WHATSAPP_NUMBER,
                 to=from_number
             )
@@ -368,7 +119,8 @@ def handle_incoming_whatsapp():
         except Exception as send_error:
             print(f"Failed to send error message: {send_error}")
         
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({"success": False, "error": error_msg}), 500
+
 
 @whatsapp_assistant_mcp_bp.route("/clear-conversation", methods=["POST"])
 def clear_conversation():
@@ -379,25 +131,27 @@ def clear_conversation():
     if from_number and not from_number.startswith('whatsapp:'):
         from_number = f'whatsapp:{from_number}'
     
-    cleared = False
     if from_number in conversations:
         del conversations[from_number]
-        cleared = True
-    if from_number in agent_conversations:
-        del agent_conversations[from_number]
-        cleared = True
-    
-    if cleared:
+        
+        # Also clear the MCP ReAct session by calling the internal endpoint
+        try:
+            # You'd need to add a clear endpoint to mcp_server.py if you want this
+            pass
+        except Exception:
+            pass
+        
         return {"message": f"Conversation cleared for {from_number}"}, 200
     
     return {"message": "No conversation found for this number"}, 404
+
 
 @whatsapp_assistant_mcp_bp.route("/clear-all-conversations", methods=["POST"])
 def clear_all_conversations():
     """Clear all conversation histories."""
     conversations.clear()
-    agent_conversations.clear()
     return {"message": "All conversations cleared"}, 200
+
 
 @whatsapp_assistant_mcp_bp.route("/test-whatsapp", methods=["POST"])
 def test_whatsapp():
@@ -412,7 +166,7 @@ def test_whatsapp():
     try:
         # Send simple test message using Twilio SDK
         message = twilio_client.messages.create(
-            body="Hello! This is a test response from your AI WhatsApp assistant.",
+            body="Hello! This is a test response from your AI WhatsApp assistant with MCP tools.",
             from_=Config.TWILIO_WHATSAPP_NUMBER,
             to=from_number
         )
@@ -428,4 +182,3 @@ def test_whatsapp():
     except Exception as e:
         print(f"Error sending test message: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
-
