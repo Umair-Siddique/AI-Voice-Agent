@@ -1,214 +1,396 @@
 import os
-import requests
-from flask import Blueprint, request, Response, jsonify
+import re
+import asyncio
+import json
+from typing import Any, Dict, List, Optional
+
+from flask import Blueprint, request, jsonify
+from openai import OpenAI
 from twilio.rest import Client
-from threading import Thread
+from fastmcp import Client as FastMCPClient
 
 from config import Config
 from utils import SYSTEM_MESSAGE
+from celery_app import celery_app
 
-# Initialize Twilio client
+# Initialize Twilio and OpenAI clients
 twilio_client = Client(Config.TWILIO_ACCOUNT_SID, Config.TWILIO_AUTH_TOKEN)
+openai_client = OpenAI(api_key=Config.OPENAI_API_KEY)
 
-whatsapp_assistant_mcp_bp = Blueprint('whatsappmcp', __name__)
+whatsapp_assistant_mcp_bp = Blueprint("whatsappmcp", __name__)
 
-# Simple in-memory conversation storage (for production, use a database)
-conversations = {}
+# Remote MCP configuration
+SIMPLYBOOK_MCP_URL = os.getenv("SIMPLYBOOK_MCP_URL", "https://simplybook-mcp-server.onrender.com/sse")
+SIMPLYBOOK_MCP_LABEL = os.getenv("SIMPLYBOOK_MCP_LABEL", "simplybook")
 
-WHATSAPP_AGENT_MODEL = os.getenv("WHATSAPP_AGENT_MODEL", "gpt-4o")
+# WhatsApp specific tuning
+WHATSAPP_HISTORY_LIMIT = int(os.getenv("WHATSAPP_HISTORY_LIMIT", "12"))  # user+assistant turns to keep
+WHATSAPP_MAX_OUTPUT_TOKENS = int(os.getenv("WHATSAPP_MAX_OUTPUT_TOKENS", "600"))
+WHATSAPP_MAX_MESSAGE_CHARS = int(os.getenv("WHATSAPP_MAX_MESSAGE_CHARS", "1500"))  # Twilio limit 1600
+DEFAULT_AGENT_STEPS = os.getenv("AGENT_MAX_STEPS", "15")
+WHATSAPP_AGENT_MAX_STEPS = int(os.getenv("WHATSAPP_AGENT_MAX_STEPS", DEFAULT_AGENT_STEPS))
+WHATSAPP_AGENT_MODEL = os.getenv("WHATSAPP_AGENT_MODEL", "gpt-5")
+
+# In-memory session storage (replace with persistent store for production)
+conversations: Dict[str, List[Dict[str, Any]]] = {}
 
 
-def call_openai_via_api(messages: list) -> str:
+def _build_agent_system_prompt(tools_list: str) -> str:
     """
-    Call OpenAI API using raw requests instead of the SDK.
-    This avoids the SSL/gevent issues we're seeing with the OpenAI SDK.
+    Reuse the same ReAct-style system prompt as the main MCP server while
+    appending WhatsApp delivery constraints.
     """
-    try:
-        response = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {Config.OPENAI_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": WHATSAPP_AGENT_MODEL,
-                "messages": messages,
-                "temperature": 0.7,
-                "max_tokens": 500,
-            },
-            timeout=30,
-        )
-        response.raise_for_status()
-        result = response.json()
-        return result["choices"][0]["message"]["content"].strip()
-    except Exception as exc:
-        raise RuntimeError(f"OpenAI API call failed: {exc}")
-
-
-def process_and_respond(from_number: str, to_number: str, incoming_msg: str):
-    """
-    Process the message and send response in a background thread.
-    This runs AFTER we've already responded to Twilio with 200 OK.
-    """
-    try:
-        print("=" * 80)
-        print(f"🔄 Background processing started")
-        print(f"📱 From: {from_number}")
-        print(f"💬 Message: {incoming_msg}")
-        print("=" * 80)
-        
-        # Get or create conversation history
-        if from_number not in conversations:
-            conversations[from_number] = [
-                {"role": "system", "content": SYSTEM_MESSAGE}
-            ]
-        
-        # Add user message
-        conversations[from_number].append({
-            "role": "user",
-            "content": incoming_msg
-        })
-        
-        # Keep only last 10 messages
-        if len(conversations[from_number]) > 11:
-            conversations[from_number] = [conversations[from_number][0]] + conversations[from_number][-10:]
-        
-        print(f"🤖 Calling OpenAI API...")
-        
-        # Call OpenAI using raw requests (avoids SDK SSL/gevent issues)
-        ai_message = call_openai_via_api(conversations[from_number])
-        
-        print(f"✅ OpenAI response received: {ai_message[:100]}...")
-        
-        # Limit message length for WhatsApp
-        if len(ai_message) > 4096:
-            ai_message = ai_message[:4093] + "..."
-        
-        # Add to conversation history
-        conversations[from_number].append({
-            "role": "assistant",
-            "content": ai_message
-        })
-        
-        print(f"📤 Sending WhatsApp reply...")
-        
-        # Send WhatsApp message
-        message = twilio_client.messages.create(
-            body=ai_message,
-            from_=Config.TWILIO_WHATSAPP_NUMBER,
-            to=from_number
-        )
-        
-        print(f"✅ WhatsApp sent! SID: {message.sid}, Status: {message.status}")
-        print("=" * 80)
-        
-    except Exception as e:
-        print(f"❌ Error in background processing: {e}")
-        import traceback
-        traceback.print_exc()
-        
-        # Try to send error message
-        try:
-            twilio_client.messages.create(
-                body="Sorry, I'm having trouble processing your message. Please try again.",
-                from_=Config.TWILIO_WHATSAPP_NUMBER,
-                to=from_number
-            )
-        except Exception as send_error:
-            print(f"❌ Failed to send error message: {send_error}")
-        
-        print("=" * 80)
-
-
-@whatsapp_assistant_mcp_bp.route("/incoming-whatsapp", methods=["POST"])
-def handle_incoming_whatsapp():
-    """
-    Handle incoming WhatsApp message.
-    Responds immediately to Twilio, then processes message in background.
-    """
-    print("=" * 80)
-    print("📥 WEBHOOK HIT - Responding immediately to Twilio")
-    print("=" * 80)
-    
-    # Get the message from Twilio
-    incoming_msg = request.values.get('Body', '').strip()
-    from_number = request.values.get('From', '')
-    to_number = request.values.get('To', '')
-    
-    print(f"📱 From: {from_number}")
-    print(f"📱 To: {to_number}")
-    print(f"💬 Message: {incoming_msg}")
-    
-    if not incoming_msg or not from_number:
-        print("❌ Missing required fields")
-        return jsonify({"success": False, "error": "Missing Body or From"}), 400
-    
-    # Start background thread to process and respond
-    thread = Thread(
-        target=process_and_respond,
-        args=(from_number, to_number, incoming_msg),
-        daemon=True
+    base_prompt = (
+        "You are a helpful AI agent that can achieve goals by planning and "
+        "invoking tools exposed by a SimplyBook MCP server. Use a tight loop: "
+        "think -> act (tool) -> observe -> repeat, then provide a final answer.\n\n"
+        "Available tools:\n"
+        f"{tools_list}\n\n"
+        "Scheduling safety:\n"
+        "- Never assume which appointment the user wants to change.\n"
+        "- If multiple bookings match their description (e.g., same day or client), list those options, ask them to choose, and wait for a confirmation.\n"
+        "- Repeat the confirmed client + appointment details before calling any reschedule, cancel, or booking tool.\n\n"
+        "Interaction protocol (STRICT):\n"
+        "1) When you need to use a tool, respond with ONLY a single JSON object:\n"
+        '{\n'
+        '  "thought": "very brief reason",\n'
+        '  "action": "<tool_name>",\n'
+        '  "action_input": { /* JSON arguments for the tool */ }\n'
+        "}\n"
+        "2) When you are ready to answer the user, respond with ONLY:\n"
+        '{\n'
+        '  "final": "<natural language answer>"\n'
+        "}\n"
+        "Rules:\n"
+        "- Never include explanatory text outside of the JSON object.\n"
+        "- Keep 'thought' short. Output human-like, concise, helpful 'final'."
     )
-    thread.start()
-    
-    print("🚀 Background thread started, responding 200 OK to Twilio")
-    print("=" * 80)
-    
-    # Respond immediately to Twilio with empty 200 OK
-    # For WhatsApp/SMS, Twilio expects either empty response or TwiML
-    # This prevents the 15-second timeout and Content-Type errors
-    return Response("", status=200, mimetype='text/plain')
+
+    whatsapp_suffix = (
+        "\n\nWhatsApp delivery constraints:\n"
+        "- Keep the final reply under four short sentences.\n"
+        "- Confirm booking details before scheduling, cancelling, or rescheduling.\n"
+        "- Avoid markdown; plain text only."
+    )
+    return base_prompt + whatsapp_suffix
 
 
-@whatsapp_assistant_mcp_bp.route("/clear-conversation", methods=["POST"])
-def clear_conversation():
-    """Clear conversation history for a specific WhatsApp number."""
-    from_number = request.json.get('phone_number', '')
-    
-    # Ensure whatsapp: prefix is added if not present
-    if from_number and not from_number.startswith('whatsapp:'):
-        from_number = f'whatsapp:{from_number}'
-    
-    if from_number in conversations:
-        del conversations[from_number]
-        return jsonify({"message": f"Conversation cleared for {from_number}"}), 200
-    
-    return jsonify({"message": "No conversation found for this number"}), 404
-
-
-@whatsapp_assistant_mcp_bp.route("/clear-all-conversations", methods=["POST"])
-def clear_all_conversations():
-    """Clear all conversation histories."""
-    conversations.clear()
-    return jsonify({"message": "All conversations cleared"}), 200
-
-
-@whatsapp_assistant_mcp_bp.route("/test-whatsapp", methods=["POST"])
-def test_whatsapp():
-    """Test endpoint with simple hardcoded response using Twilio SDK."""
-    print("Test WhatsApp endpoint hit!")
-    
-    incoming_msg = request.values.get('Body', '').strip()
-    from_number = request.values.get('From', '')
-    
-    print(f"Received test WhatsApp from {from_number}: {incoming_msg}")
-    
+def _init_conversation(session_id: str) -> None:
+    """Prime conversation with the same ReAct prompt used in the MCP server."""
     try:
-        # Send simple test message using Twilio SDK
-        message = twilio_client.messages.create(
-            body="Hello! This is a test response from your AI WhatsApp assistant.",
+        tools_list = asyncio.run(_mcp_tools_brief())
+    except Exception as exc:
+        print(f"❌ Failed to load WhatsApp MCP tools: {exc}")
+        tools_list = f"- (failed to load tools: {exc})"
+
+    conversations[session_id] = [
+        {
+            "role": "system",
+            "content": SYSTEM_MESSAGE,
+        },
+        {
+            "role": "system",
+            "content": _build_agent_system_prompt(tools_list),
+        },
+    ]
+
+
+def _truncate_for_whatsapp(text: str) -> str:
+    """Ensure responses fit within WhatsApp message limits."""
+    if len(text) <= WHATSAPP_MAX_MESSAGE_CHARS:
+        return text
+    return text[: WHATSAPP_MAX_MESSAGE_CHARS - 3] + "..."
+
+
+def _safe_to_string(value: Any) -> str:
+    """Best-effort string conversion for tool observation."""
+    try:
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, ensure_ascii=False)
+        return str(value)
+    except Exception:
+        try:
+            return repr(value)
+        except Exception:
+            return "<unserializable>"
+
+
+async def _mcp_call(tool_name: str, arguments: Dict[str, Any]) -> str:
+    """Call FastMCP tool directly (mirrors mcp_server logic)."""
+    mcp_url = SIMPLYBOOK_MCP_URL.rstrip("/")
+    try:
+        client = FastMCPClient(mcp_url)
+        async with client:
+            await asyncio.sleep(0.5)
+            result = await client.call_tool(tool_name, arguments or {})
+            data = getattr(result, "data", result)
+            return _safe_to_string(data)
+    except Exception as exc:
+        raise Exception(f"MCP call failed for '{tool_name}': {exc}")
+
+
+async def _mcp_tools_brief(limit: int = 24) -> str:
+    """Fetch list of tools for prompt priming."""
+    mcp_url = SIMPLYBOOK_MCP_URL.rstrip("/")
+    client = FastMCPClient(mcp_url)
+    lines: List[str] = []
+    async with client:
+        await asyncio.sleep(0.5)
+        tools = await client.list_tools()
+        for idx, t in enumerate(tools):
+            if idx >= limit:
+                lines.append(f"- ... and {len(tools) - limit} more")
+                break
+            name = getattr(t, "name", "unknown_tool")
+            desc = getattr(t, "description", "") or ""
+            lines.append(f"- {name}: {desc}")
+    return "\n".join(lines) if lines else "- (no tools discovered)"
+
+
+def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
+    """
+    Extract the first JSON object from text and parse it.
+    Accepts plain JSON or fenced ```json blocks.
+    """
+    if not text:
+        return None
+
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    fenced = re.search(r"```json\s*(\{[\s\S]*?\})\s*```", text, re.IGNORECASE)
+    if fenced:
+        try:
+            return json.loads(fenced.group(1))
+        except Exception:
+            pass
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidate = text[start : end + 1]
+        try:
+            return json.loads(candidate)
+        except Exception:
+            return None
+
+    return None
+
+
+async def _fetch_tool_schema(tool_name: str) -> Optional[Dict[str, Any]]:
+    """Fetch tool schema to help the model fix mistakes."""
+    client = FastMCPClient(SIMPLYBOOK_MCP_URL.rstrip("/"))
+    async with client:
+        await asyncio.sleep(0.3)
+        tools = await client.list_tools()
+        for t in tools:
+            if getattr(t, "name", None) == tool_name:
+                schema = getattr(t, "inputSchema", None) or getattr(t, "schema", None)
+                return schema if isinstance(schema, dict) else None
+    return None
+
+
+def _send_whatsapp_message(body: str, to_number: str):
+    """
+    Send WhatsApp message respecting Twilio 1600 character limit by chunking if needed.
+    Returns list of message SIDs.
+    """
+    chunk_size = min(WHATSAPP_MAX_MESSAGE_CHARS, 1500)
+    sids = []
+    for idx in range(0, len(body), chunk_size):
+        chunk = body[idx : idx + chunk_size]
+        msg = twilio_client.messages.create(
+            body=chunk,
             from_=Config.TWILIO_WHATSAPP_NUMBER,
-            to=from_number
+            to=to_number,
         )
-        
-        print(f"Test message sent! SID: {message.sid}, Status: {message.status}")
-        
-        return jsonify({
+        sids.append(msg.sid)
+    return sids
+
+
+@whatsapp_assistant_mcp_bp.route("/", methods=["GET"])
+def index():
+    """Simple status endpoint."""
+    return jsonify(
+        {
             "success": True,
-            "message_sid": message.sid,
-            "status": message.status
-        }), 200
-        
-    except Exception as e:
-        print(f"Error sending test message: {e}")
-        return jsonify({"success": False, "error": str(e)}), 500
+            "message": "WhatsApp MCP assistant ready. Point Twilio webhook to /whatsappmcp/message",
+            "mcp_server": SIMPLYBOOK_MCP_URL,
+            "history_sessions": len(conversations),
+            "history_limit": WHATSAPP_HISTORY_LIMIT,
+        }
+    )
+
+
+def _run_whatsapp_agent_step_loop(session_id: str, incoming_msg: str) -> str:
+    """
+    Core ReAct-style loop used by the WhatsApp MCP assistant.
+    This mirrors the logic from the HTTP handler but is callable from a Celery task.
+    """
+    if session_id not in conversations:
+        _init_conversation(session_id)
+
+    messages = conversations[session_id]
+    messages.append({"role": "user", "content": incoming_msg})
+
+    final_text: Optional[str] = None
+
+    protocol_reminder = (
+        "Invalid format. Respond with ONLY one JSON object per the protocol. "
+        "Either an action call:\n"
+        '{ "thought": "...", "action": "<tool_name>", "action_input": { ... } }\n'
+        "or a final answer:\n"
+        '{ "final": "<answer>" }'
+    )
+
+    for _ in range(WHATSAPP_AGENT_MAX_STEPS):
+        response = openai_client.responses.create(
+            model=WHATSAPP_AGENT_MODEL,
+            input=messages,
+            max_output_tokens=WHATSAPP_MAX_OUTPUT_TOKENS,
+        )
+
+        assistant_text = ""
+        try:
+            output_text = getattr(response, "output_text", None)
+            if isinstance(output_text, str) and output_text.strip():
+                assistant_text = output_text.strip()
+        except Exception:
+            pass
+        if not assistant_text:
+            try:
+                first_output = response.output[0]
+                first_content = first_output.content[0]
+                assistant_text = (getattr(first_content, "text", "") or "").strip()
+            except Exception:
+                assistant_text = str(response)
+
+        messages.append({"role": "assistant", "content": assistant_text})
+
+        control = _extract_json_object(assistant_text)
+        if not control:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": protocol_reminder,
+                }
+            )
+            continue
+
+        if "final" in control and control["final"]:
+            final_text = str(control["final"]).strip()
+            break
+
+        action = control.get("action")
+        action_input = control.get("action_input") or {}
+        if not action:
+            final_text = assistant_text
+            break
+
+        try:
+            observation = asyncio.run(_mcp_call(action, action_input))
+        except Exception as exc:
+            error_msg = f"Tool error calling '{action}': {exc}"
+            try:
+                schema = asyncio.run(_fetch_tool_schema(action))
+            except Exception:
+                schema = None
+            schema_hint = f"\n\nInput schema:\n{json.dumps(schema, indent=2)}" if schema else ""
+            observation = error_msg + schema_hint
+
+        if len(observation) > WHATSAPP_MAX_MESSAGE_CHARS:
+            over = len(observation) - WHATSAPP_MAX_MESSAGE_CHARS
+            observation = observation[:WHATSAPP_MAX_MESSAGE_CHARS] + f"... (truncated {over} chars)"
+
+        messages.append({"role": "user", "content": f"Tool '{action}' returned: {observation}"})
+
+    if not final_text:
+        final_text = "I stopped before finishing. Please share more details or try again."
+
+    final_text = _truncate_for_whatsapp(final_text)
+
+    messages.append({"role": "assistant", "content": final_text})
+
+    # Trim history (system + last N dialogue turns)
+    system_prompts = [m for m in messages if m["role"] == "system"]
+    dialogue = [m for m in messages if m["role"] in ("user", "assistant")]
+    if len(dialogue) > WHATSAPP_HISTORY_LIMIT:
+        dialogue = dialogue[-WHATSAPP_HISTORY_LIMIT :]
+    conversations[session_id] = system_prompts + dialogue
+
+    return final_text
+
+
+@celery_app.task(name="whatsapp_mcp.process_message")
+def process_whatsapp_mcp_message(session_id: str, from_number: str, to_number: str, incoming_msg: str) -> None:
+    """
+    Celery task: run the MCP-enabled WhatsApp agent and send the final reply via Twilio.
+    """
+    try:
+        final_text = _run_whatsapp_agent_step_loop(session_id=session_id, incoming_msg=incoming_msg)
+    except Exception as exc:
+        print(f"❌ WhatsApp MCP background error: {exc}")
+        try:
+            _send_whatsapp_message("Sorry, I ran into an error. Please try again shortly.", from_number)
+        except Exception as send_exc:
+            print(f"❌ Failed to send error notification via WhatsApp (background): {send_exc}")
+        return
+
+    try:
+        _send_whatsapp_message(final_text, from_number)
+    except Exception as send_exc:
+        print(f"❌ Failed to send WhatsApp MCP reply via Twilio: {send_exc}")
+
+
+@whatsapp_assistant_mcp_bp.route("/message", methods=["POST"])
+def handle_whatsapp_message():
+    """
+    Twilio WhatsApp webhook.
+
+    This endpoint now only enqueues a Celery task and returns quickly so that
+    Twilio always receives a fast 2xx response. The long-running MCP agent
+    loop and Twilio reply are handled asynchronously in the worker.
+    """
+    incoming_msg = (request.values.get("Body") or "").strip()
+    from_number = request.values.get("From", "").strip()
+    to_number = request.values.get("To", "").strip()
+
+    if not incoming_msg or not from_number:
+        return jsonify({"success": False, "error": "Missing message or From number"}), 400
+
+    session_id = from_number  # Use WhatsApp sender as session identifier
+
+    try:
+        process_whatsapp_mcp_message.delay(session_id, from_number, to_number, incoming_msg)
+    except Exception as exc:
+        print(f"❌ Failed to enqueue WhatsApp MCP Celery task: {exc}")
+        return jsonify({"success": False, "error": "Failed to queue message for background processing"}), 500
+
+    # Fast acknowledgment for Twilio; the actual reply is sent later via REST.
+    return jsonify({"success": True, "queued": True}), 200
+
+
+@whatsapp_assistant_mcp_bp.route("/clear-session", methods=["POST"])
+def clear_session():
+    """Clear a WhatsApp conversation identified by phone number."""
+    payload = request.get_json(silent=True) or {}
+    phone_number = payload.get("phone_number", "").strip()
+
+    if phone_number and not phone_number.startswith("whatsapp:"):
+        phone_number = f"whatsapp:{phone_number}"
+
+    if phone_number in conversations:
+        del conversations[phone_number]
+        return jsonify({"success": True, "message": f"Cleared session for {phone_number}"}), 200
+
+    return jsonify({"success": False, "message": "Session not found"}), 404
+
+
+@whatsapp_assistant_mcp_bp.route("/clear-all", methods=["POST"])
+def clear_all_sessions():
+    """Clear every WhatsApp conversation session."""
+    conversations.clear()
+    return jsonify({"success": True, "message": "All WhatsApp MCP sessions cleared"}), 200
+
