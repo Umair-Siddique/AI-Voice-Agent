@@ -76,7 +76,10 @@ def _build_agent_system_prompt(tools_list: str) -> str:
 
 
 def _init_conversation(session_id: str) -> None:
-    """Prime conversation with the same ReAct prompt used in the MCP server."""
+    """
+    Prime conversation with a single ReAct-style system prompt, matching
+    the MCP server agent behavior, with only minor WhatsApp delivery tweaks.
+    """
     try:
         tools_list = asyncio.run(_mcp_tools_brief())
     except Exception as exc:
@@ -84,10 +87,6 @@ def _init_conversation(session_id: str) -> None:
         tools_list = f"- (failed to load tools: {exc})"
 
     conversations[session_id] = [
-        {
-            "role": "system",
-            "content": SYSTEM_MESSAGE,
-        },
         {
             "role": "system",
             "content": _build_agent_system_prompt(tools_list),
@@ -307,7 +306,10 @@ def _run_whatsapp_agent_step_loop(session_id: str, incoming_msg: str) -> str:
         messages.append({"role": "user", "content": f"Tool '{action}' returned: {observation}"})
 
     if not final_text:
-        final_text = "I stopped before finishing. Please share more details or try again."
+        final_text = (
+            "I stopped before reaching a final answer due to the step limit. "
+            "You can provide missing details (for example, the provider, service, or date) and try again."
+        )
 
     final_text = _truncate_for_whatsapp(final_text)
 
