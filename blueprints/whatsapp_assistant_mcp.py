@@ -46,19 +46,25 @@ def _build_agent_system_prompt(tools_list: str) -> str:
         "think -> act (tool) -> observe -> repeat, then provide a final answer.\n\n"
         "Available tools:\n"
         f"{tools_list}\n\n"
+        "When to use tools vs direct answers:\n"
+        "- If the user only asks for general information, greetings, or questions you can answer from your own knowledge, respond directly with a final answer and do NOT call any tools.\n"
+        "- Only call tools when you truly need live booking, schedule, or service data to answer.\n\n"
         "Scheduling safety:\n"
         "- Never assume which appointment the user wants to change.\n"
         "- If multiple bookings match their description (e.g., same day or client), list those options, ask them to choose, and wait for a confirmation.\n"
         "- Repeat the confirmed client + appointment details before calling any reschedule, cancel, or booking tool.\n\n"
+        "Loop budget and tool usage:\n"
+        "- Try to use at most 10 tool calls for a single user request.\n"
+        "- If you have used many tools and still lack required details (for example provider, service, or date), STOP calling tools and ask the user for the missing information in a final answer instead.\n\n"
         "Interaction protocol (STRICT):\n"
         "1) When you need to use a tool, respond with ONLY a single JSON object:\n"
-        '{\n'
+        "{\n"
         '  "thought": "very brief reason",\n'
         '  "action": "<tool_name>",\n'
         '  "action_input": { /* JSON arguments for the tool */ }\n'
         "}\n"
         "2) When you are ready to answer the user, respond with ONLY:\n"
-        '{\n'
+        "{\n"
         '  "final": "<natural language answer>"\n'
         "}\n"
         "Rules:\n"
@@ -306,10 +312,50 @@ def _run_whatsapp_agent_step_loop(session_id: str, incoming_msg: str) -> str:
         messages.append({"role": "user", "content": f"Tool '{action}' returned: {observation}"})
 
     if not final_text:
-        final_text = (
-            "I stopped before reaching a final answer due to the step limit. "
-            "You can provide missing details (for example, the provider, service, or date) and try again."
-        )
+        # Ask the model one last time to produce a final answer without calling tools.
+        try:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "You have reached the maximum number of tool steps. "
+                        "Now respond with ONLY a final JSON object:\n"
+                        '{ "final": "<short natural language answer summarizing what you can do '
+                        'or what information is still missing>" }\n'
+                        "Do not call any more tools."
+                    ),
+                }
+            )
+            final_response = openai_client.responses.create(
+                model=WHATSAPP_AGENT_MODEL,
+                input=messages,
+                max_output_tokens=WHATSAPP_MAX_OUTPUT_TOKENS,
+            )
+
+            final_assistant_text = ""
+            try:
+                output_text = getattr(final_response, "output_text", None)
+                if isinstance(output_text, str) and output_text.strip():
+                    final_assistant_text = output_text.strip()
+            except Exception:
+                pass
+            if not final_assistant_text:
+                try:
+                    first_output = final_response.output[0]
+                    first_content = first_output.content[0]
+                    final_assistant_text = (getattr(first_content, "text", "") or "").strip()
+                except Exception:
+                    final_assistant_text = str(final_response)
+
+            messages.append({"role": "assistant", "content": final_assistant_text})
+            control = _extract_json_object(final_assistant_text)
+            if control and control.get("final"):
+                final_text = str(control["final"]).strip()
+            else:
+                final_text = final_assistant_text
+        except Exception:
+            # As a last resort, fall back to a brief generic message.
+            final_text = "Sorry, I reached an internal step limit while trying to complete your request."
 
     final_text = _truncate_for_whatsapp(final_text)
 
