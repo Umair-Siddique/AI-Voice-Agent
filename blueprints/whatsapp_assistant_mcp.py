@@ -22,89 +22,17 @@ whatsapp_assistant_mcp_bp = Blueprint("whatsappmcp", __name__)
 # Remote MCP configuration
 SIMPLYBOOK_MCP_URL = os.getenv("SIMPLYBOOK_MCP_URL", "https://simplybook-mcp-server.onrender.com/sse")
 SIMPLYBOOK_MCP_LABEL = os.getenv("SIMPLYBOOK_MCP_LABEL", "simplybook")
+SIMPLYBOOK_MCP_HEADERS_JSON = os.getenv("SIMPLYBOOK_MCP_HEADERS_JSON", "").strip()
+SIMPLYBOOK_MCP_REQUIRE_APPROVAL = os.getenv("SIMPLYBOOK_MCP_REQUIRE_APPROVAL", "").strip()
 
 # WhatsApp specific tuning
 WHATSAPP_HISTORY_LIMIT = int(os.getenv("WHATSAPP_HISTORY_LIMIT", "12"))  # user+assistant turns to keep
-WHATSAPP_MAX_OUTPUT_TOKENS = int(os.getenv("WHATSAPP_MAX_OUTPUT_TOKENS", "600"))
 WHATSAPP_MAX_MESSAGE_CHARS = int(os.getenv("WHATSAPP_MAX_MESSAGE_CHARS", "1500"))  # Twilio limit 1600
-DEFAULT_AGENT_STEPS = os.getenv("AGENT_MAX_STEPS", "30")
-WHATSAPP_AGENT_MAX_STEPS = int(os.getenv("WHATSAPP_AGENT_MAX_STEPS", DEFAULT_AGENT_STEPS))
 WHATSAPP_AGENT_MODEL = os.getenv("WHATSAPP_AGENT_MODEL", "gpt-5")
+WHATSAPP_AGENT_MAX_STEPS = int(os.getenv("WHATSAPP_AGENT_MAX_STEPS", "15"))  # Max ReAct loop iterations
 
 # In-memory session storage (replace with persistent store for production)
 conversations: Dict[str, List[Dict[str, Any]]] = {}
-
-
-def _build_agent_system_prompt(tools_list: str) -> str:
-    """
-    Reuse the same ReAct-style system prompt as the main MCP server while
-    appending WhatsApp delivery constraints.
-    """
-    base_prompt = (
-        "You are a helpful AI agent that can achieve goals by planning and "
-        "invoking tools exposed by a SimplyBook MCP server. Use a tight loop: "
-        "think -> act (tool) -> observe -> repeat, then provide a final answer.\n\n"
-        "Available tools:\n"
-        f"{tools_list}\n\n"
-        "When to use tools vs direct answers:\n"
-        "- If the user only asks for general information, greetings, or questions you can answer from your own knowledge, respond directly with a final answer and do NOT call any tools.\n"
-        "- Only call tools when you truly need live booking, schedule, or service data to answer.\n\n"
-        "Scheduling safety:\n"
-        "- Never assume which appointment the user wants to change.\n"
-        "- If multiple bookings match their description (e.g., same day or client), list those options, ask them to choose, and wait for a confirmation.\n"
-        "- Repeat the confirmed client + appointment details before calling any reschedule, cancel, or booking tool.\n\n"
-        "Loop budget and tool usage:\n"
-        "- Try to use at most 10 tool calls for a single user request.\n"
-        "- If you have used many tools and still lack required details (for example provider, service, or date), STOP calling tools and ask the user for the missing information in a final answer instead.\n\n"
-        "Interaction protocol (STRICT):\n"
-        "1) When you need to use a tool, respond with ONLY a single JSON object:\n"
-        "{\n"
-        '  "thought": "very brief reason",\n'
-        '  "action": "<tool_name>",\n'
-        '  "action_input": { /* JSON arguments for the tool */ }\n'
-        "}\n"
-        "2) When you are ready to answer the user, respond with ONLY:\n"
-        "{\n"
-        '  "final": "<natural language answer>"\n'
-        "}\n"
-        "Rules:\n"
-        "- Never include explanatory text outside of the JSON object.\n"
-        "- Keep 'thought' short. Output human-like, concise, helpful 'final'."
-    )
-
-    whatsapp_suffix = (
-        "\n\nWhatsApp delivery constraints:\n"
-        "- Keep the final reply under four short sentences.\n"
-        "- Confirm booking details before scheduling, cancelling, or rescheduling.\n"
-        "- Avoid markdown; plain text only."
-    )
-    return base_prompt + whatsapp_suffix
-
-
-def _init_conversation(session_id: str) -> None:
-    """
-    Prime conversation with a single ReAct-style system prompt, matching
-    the MCP server agent behavior, with only minor WhatsApp delivery tweaks.
-    """
-    try:
-        tools_list = asyncio.run(_mcp_tools_brief())
-    except Exception as exc:
-        print(f"❌ Failed to load WhatsApp MCP tools: {exc}")
-        tools_list = f"- (failed to load tools: {exc})"
-
-    conversations[session_id] = [
-        {
-            "role": "system",
-            "content": _build_agent_system_prompt(tools_list),
-        },
-    ]
-
-
-def _truncate_for_whatsapp(text: str) -> str:
-    """Ensure responses fit within WhatsApp message limits."""
-    if len(text) <= WHATSAPP_MAX_MESSAGE_CHARS:
-        return text
-    return text[: WHATSAPP_MAX_MESSAGE_CHARS - 3] + "..."
 
 
 def _safe_to_string(value: Any) -> str:
@@ -121,7 +49,7 @@ def _safe_to_string(value: Any) -> str:
 
 
 async def _mcp_call(tool_name: str, arguments: Dict[str, Any]) -> str:
-    """Call FastMCP tool directly (mirrors mcp_server logic)."""
+    """Call FastMCP tool directly (same as mcp_server.py)."""
     mcp_url = SIMPLYBOOK_MCP_URL.rstrip("/")
     try:
         client = FastMCPClient(mcp_url)
@@ -135,7 +63,7 @@ async def _mcp_call(tool_name: str, arguments: Dict[str, Any]) -> str:
 
 
 async def _mcp_tools_brief(limit: int = 24) -> str:
-    """Fetch list of tools for prompt priming."""
+    """Fetch list of tools for prompt priming (same as mcp_server.py)."""
     mcp_url = SIMPLYBOOK_MCP_URL.rstrip("/")
     client = FastMCPClient(mcp_url)
     lines: List[str] = []
@@ -154,7 +82,7 @@ async def _mcp_tools_brief(limit: int = 24) -> str:
 
 def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
     """
-    Extract the first JSON object from text and parse it.
+    Extract the first JSON object from text and parse it (same as mcp_server.py).
     Accepts plain JSON or fenced ```json blocks.
     """
     if not text:
@@ -185,7 +113,7 @@ def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
 
 
 async def _fetch_tool_schema(tool_name: str) -> Optional[Dict[str, Any]]:
-    """Fetch tool schema to help the model fix mistakes."""
+    """Fetch tool schema to help the model fix mistakes (same as mcp_server.py)."""
     client = FastMCPClient(SIMPLYBOOK_MCP_URL.rstrip("/"))
     async with client:
         await asyncio.sleep(0.3)
@@ -195,6 +123,68 @@ async def _fetch_tool_schema(tool_name: str) -> Optional[Dict[str, Any]]:
                 schema = getattr(t, "inputSchema", None) or getattr(t, "schema", None)
                 return schema if isinstance(schema, dict) else None
     return None
+
+
+def _build_whatsapp_system_prompt(tools_list: str) -> str:
+    """
+    Build ReAct-style system prompt for WhatsApp (same as mcp_server.py /react endpoint).
+    """
+    return (
+        "You are a helpful AI agent that can achieve goals by planning and "
+        "invoking tools exposed by a SimplyBook MCP server. Use a tight loop: "
+        "think -> act (tool) -> observe -> repeat, then provide a final answer.\n\n"
+        "Available tools:\n"
+        f"{tools_list}\n\n"
+        "Scheduling safety:\n"
+        "- Never assume which appointment the user wants to change.\n"
+        "- If multiple bookings match their description (e.g., same day or client), list those options, ask them to choose, and wait for a confirmation.\n"
+        "- Repeat the confirmed client + appointment details before calling any reschedule, cancel, or booking tool.\n\n"
+        "Interaction protocol (STRICT):\n"
+        "1) When you need to use a tool, respond with ONLY a single JSON object:\n"
+        "{\n"
+        '  "thought": "very brief reason",\n'
+        '  "action": "<tool_name>",\n'
+        '  "action_input": { /* JSON arguments for the tool */ }\n'
+        "}\n"
+        "2) When you are ready to answer the user, respond with ONLY:\n"
+        "{\n"
+        '  "final": "<natural language answer>"\n'
+        "}\n"
+        "Rules:\n"
+        "- Never include explanatory text outside of the JSON object.\n"
+        "- Keep 'thought' short. Output human-like, concise, helpful 'final'.\n"
+        "- Keep final answers under 4 short sentences for WhatsApp.\n"
+        "- Use plain text only (no markdown)."
+    )
+
+
+def _init_conversation(session_id: str) -> None:
+    """
+    Initialize a new WhatsApp conversation session with ReAct system prompt.
+    """
+    try:
+        print(f"🔍 Discovering tools from MCP server for session {session_id}")
+        tools_list = asyncio.run(_mcp_tools_brief())
+        print(f"✅ Discovered tools successfully")
+    except Exception as exc:
+        print(f"❌ Failed to discover tools: {exc}")
+        tools_list = f"- (failed to load tools: {exc})"
+
+    conversations[session_id] = [
+        {
+            "role": "system",
+            "content": _build_whatsapp_system_prompt(tools_list),
+        },
+    ]
+
+
+def _truncate_for_whatsapp(text: str) -> str:
+    """Ensure responses fit within WhatsApp message limits."""
+    if len(text) <= WHATSAPP_MAX_MESSAGE_CHARS:
+        return text
+    return text[: WHATSAPP_MAX_MESSAGE_CHARS - 3] + "..."
+
+
 
 
 def _send_whatsapp_message(body: str, to_number: str):
@@ -231,8 +221,10 @@ def index():
 
 def _run_whatsapp_agent_step_loop(session_id: str, incoming_msg: str) -> str:
     """
-    Core ReAct-style loop used by the WhatsApp MCP assistant.
-    This mirrors the logic from the HTTP handler but is callable from a Celery task.
+    ReAct-style agent loop for WhatsApp (same pattern as mcp_server.py /react endpoint).
+    - Asks the model to emit strict JSON for tool actions or final answers.
+    - Calls MCP tools locally via FastMCP.
+    - Iterates until a final answer is produced or max steps reached.
     """
     if session_id not in conversations:
         _init_conversation(session_id)
@@ -241,7 +233,7 @@ def _run_whatsapp_agent_step_loop(session_id: str, incoming_msg: str) -> str:
     messages.append({"role": "user", "content": incoming_msg})
 
     final_text: Optional[str] = None
-
+    
     protocol_reminder = (
         "Invalid format. Respond with ONLY one JSON object per the protocol. "
         "Either an action call:\n"
@@ -250,13 +242,19 @@ def _run_whatsapp_agent_step_loop(session_id: str, incoming_msg: str) -> str:
         '{ "final": "<answer>" }'
     )
 
-    for _ in range(WHATSAPP_AGENT_MAX_STEPS):
-        response = openai_client.responses.create(
-            model=WHATSAPP_AGENT_MODEL,
-            input=messages,
-            max_output_tokens=WHATSAPP_MAX_OUTPUT_TOKENS,
-        )
+    for step_num in range(WHATSAPP_AGENT_MAX_STEPS):
+        # Ask the model what to do next
+        try:
+            print(f"🔄 Step {step_num + 1}/{WHATSAPP_AGENT_MAX_STEPS} for session {session_id}")
+            response = openai_client.responses.create(
+                model=WHATSAPP_AGENT_MODEL,
+                input=messages,
+            )
+        except Exception as exc:
+            print(f"❌ OpenAI API error: {exc}")
+            return "Sorry, I'm having trouble processing your request right now. Please try again."
 
+        # Extract the assistant's raw text
         assistant_text = ""
         try:
             output_text = getattr(response, "output_text", None)
@@ -272,93 +270,67 @@ def _run_whatsapp_agent_step_loop(session_id: str, incoming_msg: str) -> str:
             except Exception:
                 assistant_text = str(response)
 
+        print(f"🤖 Model response: {assistant_text[:200]}...")
         messages.append({"role": "assistant", "content": assistant_text})
 
+        # Try to parse the control JSON
         control = _extract_json_object(assistant_text)
         if not control:
-            messages.append(
-                {
-                    "role": "user",
-                    "content": protocol_reminder,
-                }
-            )
+            # If the model didn't follow protocol, add a rail and continue
+            print(f"⚠️  Model didn't return JSON control object; asking to follow protocol")
+            messages.append({
+                "role": "user",
+                "content": protocol_reminder,
+            })
             continue
 
         if "final" in control and control["final"]:
             final_text = str(control["final"]).strip()
+            print(f"✅ Got final answer: {final_text[:100]}...")
             break
 
         action = control.get("action")
         action_input = control.get("action_input") or {}
         if not action:
+            # No action specified; assume final
             final_text = assistant_text
             break
 
+        # Execute tool and add observation
         try:
+            print(f"🔧 Calling tool: {action} with args: {action_input}")
             observation = asyncio.run(_mcp_call(action, action_input))
+            print(f"✅ Tool '{action}' succeeded: {observation[:200]}...")
         except Exception as exc:
-            error_msg = f"Tool error calling '{action}': {exc}"
+            error_msg = f"Tool error calling '{action}': {str(exc)}"
+            print(f"❌ {error_msg}")
+            # Try to fetch tool schema to help model correct inputs
             try:
-                schema = asyncio.run(_fetch_tool_schema(action))
-            except Exception:
-                schema = None
-            schema_hint = f"\n\nInput schema:\n{json.dumps(schema, indent=2)}" if schema else ""
+                tool_schema = asyncio.run(_fetch_tool_schema(action))
+            except Exception as schema_exc:
+                tool_schema = None
+                print(f"⚠️  Failed to fetch tool schema for '{action}': {schema_exc}")
+            schema_hint = f"\n\nInput schema for '{action}':\n{json.dumps(tool_schema, indent=2)}" if tool_schema else ""
             observation = error_msg + schema_hint
 
+        # Truncate observation if too long for WhatsApp context
         if len(observation) > WHATSAPP_MAX_MESSAGE_CHARS:
             over = len(observation) - WHATSAPP_MAX_MESSAGE_CHARS
             observation = observation[:WHATSAPP_MAX_MESSAGE_CHARS] + f"... (truncated {over} chars)"
 
-        messages.append({"role": "user", "content": f"Tool '{action}' returned: {observation}"})
+        # Pass observation back to the model as a user message
+        messages.append({
+            "role": "user",
+            "content": f"Tool '{action}' returned: {observation}",
+        })
 
     if not final_text:
-        # Ask the model one last time to produce a final answer without calling tools.
-        try:
-            messages.append(
-                {
-                    "role": "user",
-                    "content": (
-                        "You have reached the maximum number of tool steps. "
-                        "Now respond with ONLY a final JSON object:\n"
-                        '{ "final": "<short natural language answer summarizing what you can do '
-                        'or what information is still missing>" }\n'
-                        "Do not call any more tools."
-                    ),
-                }
-            )
-            final_response = openai_client.responses.create(
-                model=WHATSAPP_AGENT_MODEL,
-                input=messages,
-                max_output_tokens=WHATSAPP_MAX_OUTPUT_TOKENS,
-            )
+        final_text = "I stopped before reaching a final answer due to the step limit. You can provide missing details (e.g., provider_id or date) and try again."
 
-            final_assistant_text = ""
-            try:
-                output_text = getattr(final_response, "output_text", None)
-                if isinstance(output_text, str) and output_text.strip():
-                    final_assistant_text = output_text.strip()
-            except Exception:
-                pass
-            if not final_assistant_text:
-                try:
-                    first_output = final_response.output[0]
-                    first_content = first_output.content[0]
-                    final_assistant_text = (getattr(first_content, "text", "") or "").strip()
-                except Exception:
-                    final_assistant_text = str(final_response)
-
-            messages.append({"role": "assistant", "content": final_assistant_text})
-            control = _extract_json_object(final_assistant_text)
-            if control and control.get("final"):
-                final_text = str(control["final"]).strip()
-            else:
-                final_text = final_assistant_text
-        except Exception:
-            # As a last resort, fall back to a brief generic message.
-            final_text = "Sorry, I reached an internal step limit while trying to complete your request."
-
+    # Truncate for WhatsApp limits
     final_text = _truncate_for_whatsapp(final_text)
 
+    # Save final answer to conversation history
     messages.append({"role": "assistant", "content": final_text})
 
     # Trim history (system + last N dialogue turns)
