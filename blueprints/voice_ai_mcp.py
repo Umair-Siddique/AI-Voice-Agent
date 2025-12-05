@@ -3,6 +3,7 @@ import sys
 import json
 import asyncio
 import re
+import time
 from typing import Dict, List, Optional, Any
 from datetime import datetime
 
@@ -21,19 +22,86 @@ voice_mcp_bp = Blueprint("voice_mcp", __name__)
 # MCP Server Configuration
 SIMPLYBOOK_MCP_URL = os.getenv("SIMPLYBOOK_MCP_URL", "https://simplybook-mcp-server.onrender.com/sse")
 SIMPLYBOOK_MCP_LABEL = os.getenv("SIMPLYBOOK_MCP_LABEL", "simplybook")
-AGENT_MAX_STEPS = int(os.getenv("AGENT_MAX_STEPS", "10"))  # Lower for voice to keep responses fast
+SIMPLYBOOK_MCP_HEADERS_JSON = os.getenv("SIMPLYBOOK_MCP_HEADERS_JSON", "").strip()
+# For voice assistant, we want automatic tool calling without approval prompts
+# Set to "never" (default) for automatic execution, or "always" to require manual approval
+SIMPLYBOOK_MCP_REQUIRE_APPROVAL = os.getenv("SIMPLYBOOK_MCP_REQUIRE_APPROVAL", "never").strip()
 AGENT_MODEL = os.getenv("AGENT_MODEL", "gpt-5")  # Using gpt-5 for better accuracy
-VOICE_MAX_OUTPUT_TOKENS = int(os.getenv("VOICE_MAX_OUTPUT_TOKENS", "600"))
-VOICE_MAX_TOOL_OBSERVATION_CHARS = int(os.getenv("VOICE_MAX_TOOL_OBSERVATION_CHARS", "1200"))
+# Max output tokens needs to be high enough for the agentic loop:
+# - Tool discovery (mcp_list_tools)
+# - Reasoning tokens (internal thinking)
+# - Multiple tool calls
+# - Final response generation
+# 600 is too low for complex workflows, increasing to 2000
+VOICE_MAX_OUTPUT_TOKENS = int(os.getenv("VOICE_MAX_OUTPUT_TOKENS", "2000"))
+# Max tool calls to prevent infinite loops
+VOICE_MAX_TOOL_CALLS = int(os.getenv("VOICE_MAX_TOOL_CALLS", "15"))
+
+# Twilio ConversationRelay Configuration for better speech recognition
+TWILIO_LANGUAGE = os.getenv("TWILIO_LANGUAGE", "en-US")
+TWILIO_VOICE = os.getenv("TWILIO_VOICE", "Google.en-US-Neural2-A")
+TWILIO_TRANSCRIPTION_PROVIDER = os.getenv("TWILIO_TRANSCRIPTION_PROVIDER", "deepgram")  # deepgram or google
+TWILIO_DTMF_DETECTION = os.getenv("TWILIO_DTMF_DETECTION", "true").lower()
+TWILIO_INTERRUPTIBLE = os.getenv("TWILIO_INTERRUPTIBLE", "true").lower()
+TWILIO_PROFANITY_FILTER = os.getenv("TWILIO_PROFANITY_FILTER", "false").lower()
+TWILIO_WELCOME_GREETING = os.getenv("TWILIO_WELCOME_GREETING", "Hello! I'm your AI assistant. How can I help you today?")
+
+
+def _build_mcp_tools_spec() -> List[Dict[str, Any]]:
+    """
+    Build the Responses API 'tools' specification for a remote MCP server.
+
+    This follows the official OpenAI documentation:
+    https://platform.openai.com/docs/guides/tools-connectors-mcp
+    
+    When passed to client.responses.create(tools=...), the OpenAI API will:
+    1. Automatically discover tools from the MCP server
+    2. Decide which tools to call based on the conversation
+    3. Execute the tool calls on the MCP server
+    4. Process results and generate a final response
+    
+    No manual tool calling loop is needed - the API handles everything automatically.
+    """
+    tool: Dict[str, Any] = {
+        "type": "mcp",
+        "server_label": SIMPLYBOOK_MCP_LABEL,
+        "server_url": SIMPLYBOOK_MCP_URL,
+    }
+
+    # Optional headers (parsed from JSON) if provided
+    if SIMPLYBOOK_MCP_HEADERS_JSON:
+        try:
+            headers = json.loads(SIMPLYBOOK_MCP_HEADERS_JSON)
+            if isinstance(headers, dict) and headers:
+                tool["headers"] = headers
+        except json.JSONDecodeError:
+            print("⚠️  WARNING: SIMPLYBOOK_MCP_HEADERS_JSON is not valid JSON; ignoring.")
+
+    # Optional approval policy
+    # For voice assistant, we auto-approve tools to avoid interrupting the conversation
+    # Set to "never" to allow automatic tool execution
+    # Set to "always" only if you want to manually approve each tool call
+    if SIMPLYBOOK_MCP_REQUIRE_APPROVAL and SIMPLYBOOK_MCP_REQUIRE_APPROVAL != "never":
+        tool["require_approval"] = SIMPLYBOOK_MCP_REQUIRE_APPROVAL
+    else:
+        # Default to "never" for voice to enable automatic tool calling
+        tool["require_approval"] = "never"
+
+    return [tool]
+
 
 # Session storage for conversation history
+# Using OpenAI Responses API with automatic MCP tool calling (no manual ReAct loop needed)
 conversation_sessions: Dict[str, List[Dict[str, str]]] = {}
-# Agent conversation storage (for ReAct loop)
-agent_conversations: Dict[str, List[Dict[str, Any]]] = {}
+# Per-session prompt buffers to avoid sending partial transcripts
+prompt_buffers: Dict[str, Dict[str, Any]] = {}
 
 
 # ============================================================================
-# MCP Helper Functions (adapted from mcp_server.py)
+# MCP Helper Functions (for debugging and compatibility)
+# Note: These are no longer needed for the main voice response flow since
+# OpenAI's Responses API handles MCP tool calling automatically. 
+# Kept here for backwards compatibility and debugging purposes.
 # ============================================================================
 
 def _safe_to_string(value: Any) -> str:
@@ -199,21 +267,19 @@ def index():
     return jsonify(
         {
             "success": True,
-            "message": "Twilio ConversationRelay Voice Assistant with MCP tool calling is ready. Configure your Twilio number to use /voicemcp/twiml for voice calls.",
+            "message": "Twilio ConversationRelay Voice Assistant with OpenAI MCP integration is ready. Configure your Twilio number to use /voicemcp/twiml for voice calls.",
             "endpoints": {
                 "twiml": "/voicemcp/twiml",
                 "websocket": "/voicemcp/websocket",
                 "connect_status": "/voicemcp/connect-status"
             },
             "features": {
-                "mcp_tools": True,
-                "react_agent": True,
+                "mcp_integration": "OpenAI Responses API with automatic tool calling",
                 "mcp_server": SIMPLYBOOK_MCP_URL,
-                "agent_model": AGENT_MODEL,
-                "max_steps": AGENT_MAX_STEPS
+                "model": AGENT_MODEL,
+                "documentation": "https://platform.openai.com/docs/guides/tools-connectors-mcp"
             },
-            "active_sessions": len(conversation_sessions),
-            "active_agent_sessions": len(agent_conversations)
+            "active_sessions": len(conversation_sessions)
         }
     )
 
@@ -221,20 +287,30 @@ def index():
 @voice_mcp_bp.route("/test", methods=["GET"])
 def test_endpoint():
     """
-    Test endpoint to verify the service is working with MCP tools
+    Test endpoint to verify the service is working with OpenAI MCP integration
     """
     import platform
     return jsonify({
         "status": "ok",
-        "message": "Voice AI MCP endpoint is working",
+        "message": "Voice AI with OpenAI MCP integration is working",
         "openai_configured": bool(Config.OPENAI_API_KEY),
         "mcp_configured": bool(SIMPLYBOOK_MCP_URL),
         "mcp_server_url": SIMPLYBOOK_MCP_URL,
-        "agent_model": AGENT_MODEL,
-        "agent_max_steps": AGENT_MAX_STEPS,
+        "model": AGENT_MODEL,
+        "max_output_tokens": VOICE_MAX_OUTPUT_TOKENS,
+        "max_tool_calls": VOICE_MAX_TOOL_CALLS,
+        "require_approval": SIMPLYBOOK_MCP_REQUIRE_APPROVAL,
+        "implementation": "OpenAI Responses API with automatic MCP tool calling + incomplete response handling",
+        "twilio_config": {
+            "language": TWILIO_LANGUAGE,
+            "voice": TWILIO_VOICE,
+            "transcription_provider": TWILIO_TRANSCRIPTION_PROVIDER,
+            "dtmf_detection": TWILIO_DTMF_DETECTION,
+            "interruptible": TWILIO_INTERRUPTIBLE,
+            "profanity_filter": TWILIO_PROFANITY_FILTER
+        },
         "python_version": platform.python_version(),
-        "active_sessions": len(conversation_sessions),
-        "active_agent_sessions": len(agent_conversations)
+        "active_sessions": len(conversation_sessions)
     })
 
 
@@ -260,16 +336,28 @@ def twiml_handler():
     
     print(f"[TwiML] Incoming call, WebSocket URL: {ws_url}")
     
-    # Build TwiML response per Twilio docs
-    # Using Google voices which are more widely compatible
+    # Build TwiML response per Twilio docs with enhanced speech recognition settings
+    # Enhanced configuration for better speech recognition:
+    # - transcriptionProvider: Deepgram provides better accuracy for conversational speech
+    # - dtmfDetection: Enable DTMF digit detection
+    # - interruptible: Allow caller to interrupt AI responses
+    # - profanityFilter: false to avoid censoring legitimate words
     twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Connect action="/voicemcp/connect-status">
-        <ConversationRelay url="{ws_url}" language="en-US" voice="Google.en-US-Neural2-A" welcomeGreeting="Hello! I'm your AI assistant. How can I help you today?" />
+        <ConversationRelay 
+            url="{ws_url}" 
+            language="{TWILIO_LANGUAGE}" 
+            voice="{TWILIO_VOICE}" 
+            transcriptionProvider="{TWILIO_TRANSCRIPTION_PROVIDER}"
+            dtmfDetection="{TWILIO_DTMF_DETECTION}"
+            interruptible="{TWILIO_INTERRUPTIBLE}"
+            profanityFilter="{TWILIO_PROFANITY_FILTER}"
+            welcomeGreeting="{TWILIO_WELCOME_GREETING}" />
     </Connect>
 </Response>'''
     
-    print(f"[TwiML] Returned TwiML with voice: Google.en-US-Neural2-A")
+    print(f"[TwiML] Returned TwiML with voice: {TWILIO_VOICE}, transcription: {TWILIO_TRANSCRIPTION_PROVIDER}")
     
     return Response(twiml, mimetype='text/xml')
 
@@ -355,6 +443,8 @@ def register_websocket_routes(sock, app):
                             {"role": "system", "content": SYSTEM_MESSAGE},
                             {"role": "system", "content": "Be concise and conversational. Responses should be natural for voice interaction. Keep answers brief (2-3 sentences max)."}
                         ]
+                        # Initialize prompt buffer state
+                        prompt_buffers[session_id] = {"buffer": "", "last_final": "", "last_received": time.time()}
                         
                         print(f"[WebSocket] Session initialized for {session_id}")
                         
@@ -369,11 +459,13 @@ def register_websocket_routes(sock, app):
                         lang = data.get("lang", "en-US")
                         is_last = data.get("last", True)
                         
-                        if not user_text:
+                        if not user_text or not user_text.strip():
                             print("[WebSocket] Empty voicePrompt, skipping")
                             continue
                         
-                        print(f"[WebSocket] User said ({lang}): {user_text}")
+                        # Log transcription details for debugging
+                        print(f"[WebSocket] Transcribed speech ({lang}): '{user_text}'")
+                        print(f"[WebSocket] Is final utterance: {is_last}")
                         
                         # Get or create session
                         if not session_id or session_id not in conversation_sessions:
@@ -382,12 +474,56 @@ def register_websocket_routes(sock, app):
                                 {"role": "system", "content": SYSTEM_MESSAGE},
                                 {"role": "system", "content": "Be concise and conversational. Keep answers brief (2-3 sentences max)."}
                             ]
+                            prompt_buffers[session_id] = {"buffer": "", "last_final": "", "last_received": time.time()}
                             print(f"[WebSocket] Created new session: {session_id}")
                         
-                        # Generate AI response
-                        ai_response = generate_voice_response(session_id, user_text)
+                        # Strip and clean the user text before processing
+                        user_text = user_text.strip()
+
+                        # Prepare session buffer
+                        buf_state = prompt_buffers.setdefault(
+                            session_id,
+                            {"buffer": "", "last_final": "", "last_received": 0.0},
+                        )
+                        buf_state["last_received"] = time.time()
+
+                        # Merge incremental transcripts; prefer longest to avoid duplicates
+                        current_buf = buf_state.get("buffer", "")
+                        if current_buf and user_text.startswith(current_buf):
+                            merged_text = user_text
+                        elif current_buf and current_buf.startswith(user_text):
+                            merged_text = current_buf
+                        else:
+                            merged_text = f"{current_buf} {user_text}".strip() if current_buf else user_text
+
+                        buf_state["buffer"] = merged_text
+
+                        # Only process when Twilio marks the utterance as complete
+                        if not is_last:
+                            print("[WebSocket] Partial transcript stored, waiting for end of utterance...")
+                            continue
+
+                        final_text = buf_state["buffer"].strip() or user_text
+                        if not final_text:
+                            print("[WebSocket] Final transcript empty after buffering, skipping")
+                            buf_state["buffer"] = ""
+                            continue
+
+                        # If Twilio resumes the same utterance after we already answered, drop it
+                        last_final = buf_state.get("last_final", "")
+                        if last_final and final_text.startswith(last_final):
+                            print("[WebSocket] Detected continuation of previously processed utterance; ignoring to avoid duplicate sends.")
+                            buf_state["buffer"] = ""
+                            continue
+
+                        print(f"[WebSocket] Processing complete question: '{final_text}'")
                         
-                        print(f"[WebSocket] AI response: {ai_response}")
+                        # Generate AI response
+                        ai_response = generate_voice_response(session_id, final_text)
+                        buf_state["last_final"] = final_text
+                        buf_state["buffer"] = ""
+                        
+                        print(f"[WebSocket] Generated AI response: {ai_response}")
                         
                         # Send response back to Twilio for TTS
                         # Format: https://www.twilio.com/docs/voice/conversationrelay/websocket-messages#text-tokens-message
@@ -399,7 +535,7 @@ def register_websocket_routes(sock, app):
                         }
                         
                         ws.send(json.dumps(response_message))
-                        print(f"[WebSocket] Sent text response")
+                        print(f"[WebSocket] Sent text response to Twilio for TTS")
                     
                     elif event_type == "dtmf":
                         # DTMF digit pressed
@@ -442,6 +578,8 @@ def register_websocket_routes(sock, app):
             if session_id and session_id in conversation_sessions:
                 del conversation_sessions[session_id]
                 print(f"[WebSocket] Cleaned up session {session_id}")
+            if session_id and session_id in prompt_buffers:
+                del prompt_buffers[session_id]
             print("[WebSocket] Connection closed")
     
     print("✅ WebSocket routes registered for Twilio ConversationRelay")
@@ -449,182 +587,296 @@ def register_websocket_routes(sock, app):
 
 def generate_voice_response(session_id: str, user_text: str) -> str:
     """
-    Generate an AI response for voice conversation using OpenAI with ReAct-style MCP tool calling.
-    Optimized for voice: brief responses, low max_steps, fast model.
+    Generate an AI response for voice conversation using OpenAI's official MCP implementation.
+    Following: https://platform.openai.com/docs/guides/tools-connectors-mcp
+    The Responses API handles MCP tool calling automatically when tools are provided.
+    Optimized for voice: brief responses, conversational tone.
     """
     if not Config.OPENAI_API_KEY:
         return "Configuration error: OpenAI API key is not set."
     
-    # Initialize agent conversation with ReAct protocol if new session
-    if session_id not in agent_conversations:
-        # Discover tools list for better guidance
-        try:
-            print(f"🔍 [Voice] Discovering tools from MCP server: {SIMPLYBOOK_MCP_URL}")
-            tools_list = asyncio.run(_mcp_tools_brief())
-            print(f"✅ [Voice] Discovered tools successfully")
-        except Exception as exc:
-            print(f"❌ [Voice] Failed to discover tools: {exc}")
-            tools_list = f"- (failed to load tools: {exc})"
-
+    # Initialize conversation if new session
+    if session_id not in conversation_sessions:
+        print(f"")
+        print(f"{'='*80}")
+        print(f"🆕 [Voice] Initializing new session: {session_id}")
+        print(f"{'='*80}")
+        
+        # Voice-optimized system message
         system_prompt = (
-            "You are a helpful AI voice assistant that can achieve goals by using tools. "
-            "Keep responses VERY brief and conversational (1-2 sentences max for voice).\n\n"
-            "Available tools:\n"
-            f"{tools_list}\n\n"
-            "Interaction protocol (STRICT):\n"
-            "1) When you need to use a tool, respond with ONLY a single JSON object:\n"
-            '{\n'
-            '  "thought": "brief reason",\n'
-            '  "action": "<tool_name>",\n'
-            '  "action_input": { /* JSON arguments */ }\n'
-            "}\n"
-            "2) When ready to answer, respond with ONLY:\n"
-            '{\n'
-            '  "final": "<brief natural answer>"\n'
-            "}\n"
-            "Rules:\n"
-            "- Keep responses SHORT and conversational for voice.\n"
-            "- Never include text outside JSON.\n"
-            "- For appointments: always confirm details before changes.\n"
+            "You are a helpful AI assistant for a booking system with access to SimplyBook MCP tools. "
+            "Be conversational and keep responses brief (2-3 sentences max) for voice interaction.\n\n"
+            "IMPORTANT - Tool Usage:\n"
+            "- ALWAYS use tools to get real-time data - NEVER make assumptions or guess\n"
+            "- When asked about services: use get_services tool\n"
+            "- When asked about availability: use get_available_slots tool with service_id, provider_id, and date\n"
+            "- When booking: use get_providers, then get_available_slots to confirm time exists, then create_booking\n"
+            "- For client info: use get_clients_list or create_client if needed\n\n"
+            "Scheduling safety:\n"
+            "- ALWAYS verify availability with get_available_slots before creating bookings\n"
+            "- Never say 'no availability' without actually checking the tool\n"
+            "- If multiple providers exist, ask user to choose or pick the first one\n"
+            "- Confirm all booking details (date, time, service, client) before creating\n\n"
+            "Remember: You have tools - use them! Don't guess or make up information."
         )
-        agent_conversations[session_id] = [{"role": "system", "content": system_prompt}]
+        conversation_sessions[session_id] = [{"role": "system", "content": system_prompt}]
     
     # Append user message
-    agent_conversations[session_id].append({"role": "user", "content": user_text})
-    messages = agent_conversations[session_id]
+    print(f"")
+    print(f"{'='*80}")
+    print(f"👤 [Voice] User: {user_text}")
+    print(f"{'='*80}")
+    print(f"")
     
-    final_text: Optional[str] = None
+    conversation_sessions[session_id].append({"role": "user", "content": user_text})
+    messages = conversation_sessions[session_id]
+    
     client = OpenAI(api_key=Config.OPENAI_API_KEY)
     
-    # ReAct loop with lower max_steps for voice (faster responses)
-    for step in range(AGENT_MAX_STEPS):
-        print(f"[Voice] ReAct step {step + 1}/{AGENT_MAX_STEPS}")
+    # Build MCP tools spec following OpenAI documentation
+    # This tells the Responses API to automatically discover and use MCP server tools
+    mcp_tools = _build_mcp_tools_spec()
+    
+    try:
+        print(f"🔧 [Voice] Calling Responses API with MCP tools...")
+        
+        # Use OpenAI's official Responses API with MCP tools
+        # The API will automatically:
+        # 1. Discover tools from the MCP server
+        # 2. Decide which tools to call based on the conversation
+        # 3. Execute the tools
+        # 4. Process the results
+        # 5. Generate a final response
+        response = client.responses.create(
+            model=AGENT_MODEL,
+            input=messages,
+            tools=mcp_tools,  # This enables automatic MCP tool calling
+            max_output_tokens=VOICE_MAX_OUTPUT_TOKENS,  # Increased to 2000 for complex workflows
+            max_tool_calls=VOICE_MAX_TOOL_CALLS,  # Limit tool calls to prevent infinite loops
+        )
+        
+        # Extract the final response text
+        final_text = ""
+        approval_needed = False
+        response_status = getattr(response, 'status', 'unknown')
         
         try:
-            # Use Responses API for better GPT-5 compatibility
-            response = client.responses.create(
-                model=AGENT_MODEL,
-                input=messages,
-                max_output_tokens=VOICE_MAX_OUTPUT_TOKENS,
-            )
-        except Exception as exc:
-            print(f"❌ [Voice] OpenAI error: {exc}")
-            return "I'm sorry, I encountered an error. Could you please repeat that?"
+            # Check if there are any approval requests blocking the response
+            outputs = getattr(response, "output", [])
+            for output in outputs:
+                output_type = getattr(output, "type", None)
+                
+                # Check for approval request
+                if output_type == "mcp_approval_request":
+                    approval_needed = True
+                    tool_name = getattr(output, "name", "unknown")
+                    print(f"⚠️  [Voice] Approval required for tool: {tool_name}")
+                    print(f"⚠️  [Voice] This should not happen in voice mode. Check SIMPLYBOOK_MCP_REQUIRE_APPROVAL config.")
+                    final_text = "I need to access some information, but I'm waiting for approval. Please check your configuration."
+                    break
+            
+            # If no approval needed, extract the actual message text
+            if not approval_needed:
+                # Try to get output_text first (GPT-4 style)
+                output_text = getattr(response, "output_text", None)
+                if isinstance(output_text, str) and output_text.strip():
+                    final_text = output_text.strip()
+                    print(f"✅ [Voice] Extracted from output_text")
+                
+                # If output_text not available, try to extract from output array
+                if not final_text:
+                    for output in outputs:
+                        output_type = getattr(output, "type", None)
+                        
+                        # Look for message type output (the final assistant message)
+                        if output_type == "message":
+                            content = getattr(output, "content", [])
+                            for content_item in content:
+                                if hasattr(content_item, "type") and content_item.type == "text":
+                                    text = getattr(content_item, "text", "")
+                                    if text and text.strip():
+                                        final_text = text.strip()
+                                        print(f"✅ [Voice] Extracted from message.content.text")
+                                        break
+                            if final_text:
+                                break
+                        
+                        # Check for text in tool call results (could be mcp_call_tool or mcp_call)
+                        elif output_type in ("mcp_call_tool", "mcp_call"):
+                            if not final_text:  # Only use if no message found yet
+                                content = getattr(output, "content", [])
+                                for content_item in content:
+                                    if hasattr(content_item, "type") and content_item.type == "text":
+                                        text = getattr(content_item, "text", "")
+                                        if text and text.strip():
+                                            # This is tool output, not final response
+                                            # Don't use it as final text
+                                            break
+                        
+                        # Also check for text content directly in output
+                        elif hasattr(output, "text"):
+                            text = getattr(output, "text", "")
+                            if text and text.strip():
+                                final_text = text.strip()
+                                print(f"✅ [Voice] Extracted from output.text")
+                                break
         
-        # Extract assistant text similar to mcp_server.py
-        assistant_text = ""
+        except Exception as e:
+            print(f"❌ [Voice] Error extracting text from response: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        # Handle incomplete responses (response_status already set above)
+        if not final_text:
+            print(f"⚠️  [Voice] No text response extracted. Response status: {response_status}")
+            output_types = [getattr(o, 'type', 'unknown') for o in getattr(response, 'output', [])]
+            print(f"⚠️  [Voice] Response outputs: {output_types}")
+            
+            # If response is incomplete, try to continue it
+            if response_status == 'incomplete':
+                print(f"🔄 [Voice] Response incomplete, attempting to continue...")
+                try:
+                    # Continue the incomplete response
+                    response_id = getattr(response, 'id', None)
+                    if response_id:
+                        continued_response = client.responses.create(
+                            model=AGENT_MODEL,
+                            input=messages,
+                            tools=mcp_tools,
+                            max_output_tokens=VOICE_MAX_OUTPUT_TOKENS,
+                            max_tool_calls=VOICE_MAX_TOOL_CALLS,
+                            previous_response_id=response_id,  # Continue from previous response
+                        )
+                        
+                        # Try to extract text from continued response
+                        outputs = getattr(continued_response, 'output', [])
+                        for output in outputs:
+                            output_type = getattr(output, 'type', None)
+                            if output_type == "message":
+                                content = getattr(output, "content", [])
+                                for content_item in content:
+                                    if hasattr(content_item, "type") and content_item.type == "text":
+                                        text = getattr(content_item, "text", "")
+                                        if text and text.strip():
+                                            final_text = text.strip()
+                                            print(f"✅ [Voice] Extracted text from continued response")
+                                            break
+                                if final_text:
+                                    break
+                except Exception as e:
+                    print(f"❌ [Voice] Error continuing incomplete response: {e}")
+            
+            # If still no text, provide a helpful fallback
+            if not final_text:
+                final_text = "I'm having trouble completing that request. Could you try rephrasing your question?"
+        
+        response_status = getattr(response, 'status', 'unknown')
+        print(f"🤖 [Voice] Response received (status: {response_status})")
+        print(f"")
+        
+        # Log ALL outputs for debugging
         try:
-            output_text = getattr(response, "output_text", None)
-            if isinstance(output_text, str) and output_text.strip():
-                assistant_text = output_text.strip()
-        except Exception:
-            pass
-        if not assistant_text:
-            try:
-                first_output = response.output[0]
-                first_content = first_output.content[0]
-                assistant_text = (getattr(first_content, "text", "") or "").strip()
-            except Exception:
-                assistant_text = str(response)
+            outputs = getattr(response, "output", [])
+            print(f"📊 [Voice] Response has {len(outputs)} output items")
+            
+            # Debug: dump output types and basic info
+            for idx, output in enumerate(outputs):
+                output_type = getattr(output, "type", None)
+                # Also log the actual attribute names to debug
+                attrs = [attr for attr in dir(output) if not attr.startswith('_')]
+                print(f"   [{idx}] Type: {output_type}, Attributes: {attrs[:5]}")  # First 5 attrs
+            
+            print(f"")
+            print(f"📋 [Voice] Detailed output breakdown:")
+            
+            for idx, output in enumerate(outputs):
+                output_type = getattr(output, "type", None)
+                print(f"   [{idx}] Type: {output_type}")
+                
+                # Log when model requests to list tools
+                if output_type == "mcp_list_tools":
+                    server_label = getattr(output, "server_label", "unknown")
+                    tools = getattr(output, "tools", [])
+                    print(f"🔍 [Voice] Model requested to list tools from MCP server: {server_label}")
+                    print(f"   Found {len(tools)} tools")
+                
+                # Log when model calls an MCP tool (could be mcp_call_tool or mcp_call)
+                elif output_type in ("mcp_call_tool", "mcp_call"):
+                    tool_name = getattr(output, "name", "unknown")
+                    tool_args = getattr(output, "arguments", {})
+                    print(f"🔧 [Voice] Model called MCP tool: {tool_name}")
+                    print(f"   Args: {json.dumps(tool_args, indent=2)}")
+                    
+                    # Check if there was an error
+                    error = getattr(output, "error", None)
+                    if error:
+                        print(f"❌ [Voice] Tool call error: {error}")
+                    else:
+                        # Get the result
+                        content = getattr(output, "content", [])
+                        if content:
+                            # Content is usually a list of content items
+                            for content_item in content:
+                                if hasattr(content_item, "type") and content_item.type == "text":
+                                    text = getattr(content_item, "text", "")
+                                    print(f"✅ [Voice] Tool result (text): {text[:300]}...")
+                                else:
+                                    print(f"✅ [Voice] Tool result: {str(content_item)[:300]}...")
+                
+                # Log approval requests (if require_approval is set)
+                elif output_type == "mcp_approval_request":
+                    tool_name = getattr(output, "name", "unknown")
+                    args = getattr(output, "arguments", {})
+                    print(f"⚠️  [Voice] MCP tool approval requested for: {tool_name}")
+                    print(f"   Args: {json.dumps(args, indent=2)}")
+                
+                # Log reasoning
+                elif output_type == "reasoning":
+                    summary = getattr(output, "summary", [])
+                    if summary:
+                        print(f"💭 [Voice] Reasoning: {summary[:100]}...")
+                
+                # Log message outputs
+                elif output_type == "message":
+                    print(f"💬 [Voice] Message output detected")
+        except Exception as e:
+            print(f"⚠️  [Voice] Error logging outputs: {e}")
+            import traceback
+            traceback.print_exc()
         
-        if not assistant_text:
-            print(f"⚠️  [Voice] Empty assistant content. Raw response: {response}")
-            return "I'm having trouble generating a response. Please try again."
+        print(f"")
+        print(f"{'='*80}")
+        print(f"💬 [Voice] Final Response: {final_text}")
+        print(f"{'='*80}")
+        print(f"")
         
-        print(f"🤖 [Voice] Model response: {assistant_text[:150]}...")
-        messages.append({"role": "assistant", "content": assistant_text})
+        # Update conversation history with assistant's response
+        conversation_sessions[session_id].append({"role": "assistant", "content": final_text})
         
-        # Parse control JSON
-        control = _extract_json_object(assistant_text)
-        if not control:
-            # Model didn't follow protocol - guide it back
-            print(f"⚠️  [Voice] Model didn't return JSON; asking to follow protocol")
-            messages.append({
-                "role": "user",
-                "content": (
-                    "Invalid format. Respond with ONLY JSON:\n"
-                    '{ "thought": "...", "action": "<tool>", "action_input": {...} }\n'
-                    'or { "final": "<answer>" }'
-                ),
-            })
-            continue
+        # Prune history to keep conversation manageable
+        system_msgs = [m for m in conversation_sessions[session_id] if m.get("role") == "system"]
+        convo = [m for m in conversation_sessions[session_id] if m.get("role") in ("user", "assistant")]
+        if len(convo) > 12:  # Keep last 6 exchanges (6 user + 6 assistant)
+            convo = convo[-12:]
+        conversation_sessions[session_id] = system_msgs + convo
         
-        # Check if final answer
-        if "final" in control and control["final"]:
-            final_text = str(control["final"]).strip()
-            print(f"✅ [Voice] Final answer: {final_text}")
-            break
+        return final_text
         
-        # Execute tool action
-        action = control.get("action")
-        action_input = control.get("action_input") or {}
-        if not action:
-            # No action specified, treat as final
-            final_text = assistant_text
-            break
-        
-        try:
-            print(f"🔧 [Voice] Calling tool: {action} with args: {action_input}")
-            observation = asyncio.run(_mcp_call(action, action_input))
-            if len(observation) > VOICE_MAX_TOOL_OBSERVATION_CHARS:
-                truncated_len = len(observation) - VOICE_MAX_TOOL_OBSERVATION_CHARS
-                observation = observation[:VOICE_MAX_TOOL_OBSERVATION_CHARS] + f"... (truncated {truncated_len} chars)"
-            print(f"✅ [Voice] Tool '{action}' result: {observation[:150]}...")
-        except Exception as exc:
-            error_msg = f"Tool error calling '{action}': {str(exc)}"
-            print(f"❌ [Voice] {error_msg}")
-            # Try to fetch schema to help model
-            try:
-                tool_schema = asyncio.run(_fetch_tool_schema(action))
-            except Exception:
-                tool_schema = None
-            schema_hint = f"\n\nInput schema:\n{json.dumps(tool_schema, indent=2)}" if tool_schema else ""
-            observation = error_msg + schema_hint
-        
-        # Pass observation back to model
-        messages.append({
-            "role": "user",
-            "content": f"Tool '{action}' returned: {observation}",
-        })
-    
-    # If no final answer, provide fallback
-    if not final_text:
-        final_text = "I need more information to help you. Could you provide more details?"
-    
-    # Save the final response to conversation history
-    agent_conversations[session_id].append({"role": "assistant", "content": final_text})
-    
-    # Prune history to keep manageable (keep system + last 6 turns)
-    system_msgs = [m for m in agent_conversations[session_id] if m.get("role") == "system"]
-    convo = [m for m in agent_conversations[session_id] if m.get("role") in ("user", "assistant")]
-    if len(convo) > 12:  # 6 user + 6 assistant
-        convo = convo[-12:]
-    agent_conversations[session_id] = system_msgs + convo
-    
-    return final_text
+    except Exception as exc:
+        print(f"❌ [Voice] OpenAI API error: {exc}")
+        import traceback
+        traceback.print_exc()
+        return "I'm sorry, I encountered an error. Could you please repeat that?"
 
 
 def _print_banner() -> None:
     print("")
-    print("=== Twilio ConversationRelay Voice Assistant ===")
-    print("Configure your Twilio number with the /voice/twiml endpoint.")
-    print("The assistant will handle phone calls using Twilio's voice AI.")
+    print("=== Twilio ConversationRelay Voice Assistant with OpenAI MCP ===")
+    print("Configure your Twilio number with the /voicemcp/twiml endpoint.")
+    print("Using OpenAI's Responses API with automatic MCP tool calling.")
+    print("Documentation: https://platform.openai.com/docs/guides/tools-connectors-mcp")
     print("")
 
 
-if __name__ == "__main__":
-    # Print setup instructions when run directly
-    _print_banner()
-    print("Setup Instructions:")
-    print("1. Ensure your Flask app is running with flask-sock enabled")
-    print("2. Configure your Twilio phone number:")
-    print("   - Go to Twilio Console > Phone Numbers")
-    print("   - Select your number")
-    print("   - Under 'Voice & Fax', set 'A CALL COMES IN' to:")
-    print("     Webhook: https://your-domain.com/voice/twiml")
-    print("     HTTP POST")
-    print("3. Make sure your server is publicly accessible (use ngrok for testing)")
-    print("")
-    print("Example ngrok command: ngrok http 5000")
-    print("")
+
 
