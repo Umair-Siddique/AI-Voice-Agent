@@ -36,6 +36,9 @@ AGENT_MODEL = os.getenv("AGENT_MODEL", "gpt-5")  # Using gpt-5 for better accura
 VOICE_MAX_OUTPUT_TOKENS = int(os.getenv("VOICE_MAX_OUTPUT_TOKENS", "2000"))
 # Max tool calls to prevent infinite loops
 VOICE_MAX_TOOL_CALLS = int(os.getenv("VOICE_MAX_TOOL_CALLS", "15"))
+# Cooldown after sending a final answer to avoid immediately processing
+# trailing transcript fragments as new prompts (seconds)
+VOICE_FINAL_COOLDOWN_SECONDS = float(os.getenv("VOICE_FINAL_COOLDOWN_SECONDS", "1.0"))
 
 # Twilio ConversationRelay Configuration for better speech recognition
 TWILIO_LANGUAGE = os.getenv("TWILIO_LANGUAGE", "en-US")
@@ -199,6 +202,30 @@ def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
             return None
 
     return None
+
+
+def _is_continuation(prev: str, current: str) -> bool:
+    """
+    Heuristic to detect if `current` is just a continuation/duplication of the
+    previous final user text (e.g., trailing fragment after we already sent a response).
+    """
+    if not prev or not current:
+        return False
+
+    prev_norm = prev.strip().lower()
+    curr_norm = current.strip().lower()
+
+    # Direct prefix/suffix overlap
+    if curr_norm.startswith(prev_norm) or prev_norm.startswith(curr_norm):
+        return True
+
+    prev_tokens = prev_norm.split()
+    curr_tokens = curr_norm.split()
+    if not prev_tokens or not curr_tokens:
+        return False
+
+    overlap = len(set(prev_tokens) & set(curr_tokens)) / min(len(prev_tokens), len(curr_tokens))
+    return overlap >= 0.7
 
 
 def _find_first_json_block(text: str) -> Optional[str]:
@@ -509,23 +536,54 @@ def register_websocket_routes(sock, app):
                             buf_state["buffer"] = ""
                             continue
 
+                        now = time.time()
+                        last_final_time = buf_state.get("last_final_time", 0.0)
+                        if last_final_time and (now - last_final_time) < VOICE_FINAL_COOLDOWN_SECONDS:
+                            print("[WebSocket] Within cooldown window after previous response; skipping to avoid trailing fragments.")
+                            buf_state["buffer"] = ""
+                            continue
+
                         # If Twilio resumes the same utterance after we already answered, drop it
                         last_final = buf_state.get("last_final", "")
-                        if last_final and final_text.startswith(last_final):
-                            print("[WebSocket] Detected continuation of previously processed utterance; ignoring to avoid duplicate sends.")
+                        if last_final and _is_continuation(last_final, final_text):
+                            print("[WebSocket] Detected continuation/duplicate of previous utterance; ignoring to avoid duplicate sends.")
                             buf_state["buffer"] = ""
                             continue
 
                         print(f"[WebSocket] Processing complete question: '{final_text}'")
                         
-                        # Generate AI response
+                        # Mark the time we are processing to avoid immediate follow-up fragments
+                        buf_state["last_final_time"] = now
+
+                        # Check if tools are needed before generating response
+                        # Get current conversation history (without the new user message yet)
+                        current_history = conversation_sessions.get(session_id, [])
+                        needs_tools = _check_if_tools_needed(final_text, current_history)
+                        
+                        # If tools are needed, send immediate acknowledgment
+                        if needs_tools:
+                            acknowledgment = "Please give me a few minutes, let me check."
+                            print(f"[WebSocket] Tools needed - sending immediate acknowledgment: {acknowledgment}")
+                            
+                            # Send acknowledgment immediately
+                            ack_message = {
+                                "type": "text",
+                                "token": acknowledgment,
+                                "last": True,
+                                "interruptible": True
+                            }
+                            ws.send(json.dumps(ack_message))
+                            print(f"[WebSocket] Sent immediate acknowledgment to Twilio")
+
+                        # Generate AI response (this will include tool calls if needed)
                         ai_response = generate_voice_response(session_id, final_text)
                         buf_state["last_final"] = final_text
+                        buf_state["last_final_time"] = time.time()
                         buf_state["buffer"] = ""
                         
                         print(f"[WebSocket] Generated AI response: {ai_response}")
                         
-                        # Send response back to Twilio for TTS
+                        # Send final response back to Twilio for TTS
                         # Format: https://www.twilio.com/docs/voice/conversationrelay/websocket-messages#text-tokens-message
                         response_message = {
                             "type": "text",
@@ -535,7 +593,7 @@ def register_websocket_routes(sock, app):
                         }
                         
                         ws.send(json.dumps(response_message))
-                        print(f"[WebSocket] Sent text response to Twilio for TTS")
+                        print(f"[WebSocket] Sent final text response to Twilio for TTS")
                     
                     elif event_type == "dtmf":
                         # DTMF digit pressed
@@ -583,6 +641,78 @@ def register_websocket_routes(sock, app):
             print("[WebSocket] Connection closed")
     
     print("✅ WebSocket routes registered for Twilio ConversationRelay")
+
+
+def _check_if_tools_needed(user_text: str, conversation_history: List[Dict[str, str]]) -> bool:
+    """
+    Analyze the user query using OpenAI to determine if SimplyBook MCP tools are needed.
+    Uses recent conversation context to avoid asking for time when the user is just chatting.
+    Returns True if tools are likely needed, False otherwise.
+    """
+    if not Config.OPENAI_API_KEY:
+        return False
+    
+    client = OpenAI(api_key=Config.OPENAI_API_KEY)
+
+    # Include a short slice of recent conversation so the model can understand context.
+    # Limit total characters to keep the prompt compact for the fast model.
+    recent_msgs = [
+        m for m in conversation_history[-8:]  # last ~4 turns (user + assistant)
+        if m.get("role") in ("user", "assistant")
+    ]
+    history_lines: List[str] = []
+    total_chars = 0
+    for msg in recent_msgs:
+        role = msg.get("role", "unknown")
+        content = (msg.get("content", "") or "").strip()
+        if not content:
+            continue
+        line = f"{role}: {content}"
+        total_chars += len(line)
+        history_lines.append(line)
+        if total_chars >= 1500:  # soft cap to avoid long prompts
+            break
+    history_block = "\n".join(history_lines) if history_lines else "(no prior turns)"
+    
+    # Build a focused analysis prompt
+    analysis_prompt = (
+        "Analyze the following user query and determine if it requires accessing SimplyBook booking system tools.\n\n"
+        "Conversation so far:\n"
+        f"{history_block}\n\n"
+        "SimplyBook tools are needed for:\n"
+        "- Getting services list (get_services)\n"
+        "- Checking availability (get_available_slots)\n"
+        "- Getting providers (get_providers)\n"
+        "- Creating bookings (create_booking)\n"
+        "- Managing clients (get_clients_list, create_client)\n"
+        "- Updating existing appointments (rescheduling) or cancelling bookings\n"
+        "- Any query about appointments, bookings, schedules, availability, services, or providers\n\n"
+        "Simple conversational queries that don't need booking system data do NOT require tools.\n\n"
+        "User query: " + user_text + "\n\n"
+        "Respond with ONLY 'YES' if tools are needed, or 'NO' if not needed. No other text."
+    )
+    
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",  # Use a fast, cheap model for analysis
+            messages=[
+                {"role": "system", "content": "You are a tool usage analyzer. Respond with only YES or NO."},
+                {"role": "user", "content": analysis_prompt}
+            ],
+            max_tokens=10,
+            temperature=0
+        )
+        
+        answer = response.choices[0].message.content.strip().upper()
+        needs_tools = answer == "YES"
+        
+        print(f"🔍 [Voice] Tool analysis: Query needs tools = {needs_tools}")
+        return needs_tools
+        
+    except Exception as e:
+        print(f"⚠️  [Voice] Error analyzing tool need: {e}")
+        # On error, assume tools might be needed to be safe
+        return True
 
 
 def generate_voice_response(session_id: str, user_text: str) -> str:
@@ -660,6 +790,22 @@ def generate_voice_response(session_id: str, user_text: str) -> str:
         approval_needed = False
         response_status = getattr(response, 'status', 'unknown')
         
+        # Helper function to count tool calls
+        def count_tool_calls(response_obj):
+            """Count the number of tool calls in a response."""
+            count = 0
+            outputs = getattr(response_obj, 'output', [])
+            for output in outputs:
+                output_type = getattr(output, 'type', None)
+                if output_type in ("mcp_call_tool", "mcp_call"):
+                    count += 1
+            return count
+        
+        # Log initial tool calls
+        initial_tool_calls = count_tool_calls(response)
+        if initial_tool_calls > 0:
+            print(f"📊 [Voice] Initial response tool calls: {initial_tool_calls}/{VOICE_MAX_TOOL_CALLS}")
+        
         try:
             # Check if there are any approval requests blocking the response
             outputs = getattr(response, "output", [])
@@ -726,29 +872,93 @@ def generate_voice_response(session_id: str, user_text: str) -> str:
             import traceback
             traceback.print_exc()
         
+        # Track the final response object for tool call counting
+        final_response_obj = response
+        
         # Handle incomplete responses (response_status already set above)
         if not final_text:
             print(f"⚠️  [Voice] No text response extracted. Response status: {response_status}")
             output_types = [getattr(o, 'type', 'unknown') for o in getattr(response, 'output', [])]
             print(f"⚠️  [Voice] Response outputs: {output_types}")
             
-            # If response is incomplete, try to continue it
+            # If response is incomplete, try to continue it (may need multiple continuations for complex workflows)
             if response_status == 'incomplete':
                 print(f"🔄 [Voice] Response incomplete, attempting to continue...")
-                try:
-                    # Continue the incomplete response
-                    response_id = getattr(response, 'id', None)
-                    if response_id:
+                max_continuations = 3  # Allow up to 3 continuations for complex multi-tool workflows
+                current_response = response
+                
+                # Count tool calls made so far
+                current_tool_calls = count_tool_calls(response)
+                print(f"📊 [Voice] Tool calls made so far: {current_tool_calls}/{VOICE_MAX_TOOL_CALLS}")
+                
+                for continuation_attempt in range(max_continuations):
+                    try:
+                        response_id = getattr(current_response, 'id', None)
+                        if not response_id:
+                            print(f"⚠️  [Voice] No response ID available for continuation")
+                            break
+                        
+                        # Count tool calls in current response
+                        current_tool_calls = count_tool_calls(current_response)
+                        remaining_tool_calls = max(0, VOICE_MAX_TOOL_CALLS - current_tool_calls)
+                        
+                        if remaining_tool_calls <= 0:
+                            print(f"⚠️  [Voice] Tool call limit reached ({current_tool_calls}/{VOICE_MAX_TOOL_CALLS}). Cannot continue.")
+                            break
+                        
+                        print(f"🔄 [Voice] Continuation attempt {continuation_attempt + 1}/{max_continuations}...")
+                        print(f"📊 [Voice] Remaining tool calls: {remaining_tool_calls}")
+                        
+                        # When using previous_response_id, max_tool_calls should be the TOTAL limit
+                        # OpenAI API handles this automatically, but we pass it for clarity
                         continued_response = client.responses.create(
                             model=AGENT_MODEL,
                             input=messages,
                             tools=mcp_tools,
                             max_output_tokens=VOICE_MAX_OUTPUT_TOKENS,
-                            max_tool_calls=VOICE_MAX_TOOL_CALLS,
+                            max_tool_calls=VOICE_MAX_TOOL_CALLS,  # Total limit across all responses
                             previous_response_id=response_id,  # Continue from previous response
                         )
                         
+                        continued_status = getattr(continued_response, 'status', 'unknown')
+                        print(f"🔄 [Voice] Continued response status: {continued_status}")
+                        
+                        # Log tool calls in continued response for debugging
+                        continued_outputs = getattr(continued_response, 'output', [])
+                        continued_output_types = [getattr(o, 'type', 'unknown') for o in continued_outputs]
+                        print(f"🔄 [Voice] Continued response outputs: {continued_output_types}")
+                        
+                        # Log any tool calls made in continuation
+                        continuation_tool_calls = 0
+                        for output in continued_outputs:
+                            output_type = getattr(output, 'type', None)
+                            if output_type in ("mcp_call_tool", "mcp_call"):
+                                continuation_tool_calls += 1
+                                tool_name = getattr(output, "name", "unknown")
+                                tool_args = getattr(output, "arguments", {})
+                                print(f"🔧 [Voice] Continued response called tool: {tool_name}")
+                                print(f"   Args: {json.dumps(tool_args, indent=2) if isinstance(tool_args, dict) else tool_args}")
+                        
+                        # Count total tool calls across all responses
+                        total_tool_calls = count_tool_calls(continued_response)
+                        print(f"📊 [Voice] Total tool calls: {total_tool_calls}/{VOICE_MAX_TOOL_CALLS}")
+                        
+                        # Check if we've reached the tool call limit
+                        if total_tool_calls >= VOICE_MAX_TOOL_CALLS:
+                            print(f"⚠️  [Voice] Tool call limit reached ({total_tool_calls}/{VOICE_MAX_TOOL_CALLS})")
+                            if not final_text and continued_status == 'incomplete':
+                                final_text = "I've reached the maximum number of steps for this request. Please try asking a simpler question or break it into smaller parts."
+                            break
+                        
                         # Try to extract text from continued response
+                        # First check output_text
+                        output_text = getattr(continued_response, "output_text", None)
+                        if isinstance(output_text, str) and output_text.strip():
+                            final_text = output_text.strip()
+                            print(f"✅ [Voice] Extracted from continued response output_text")
+                            break
+                        
+                        # Then check message outputs
                         outputs = getattr(continued_response, 'output', [])
                         for output in outputs:
                             output_type = getattr(output, 'type', None)
@@ -759,12 +969,43 @@ def generate_voice_response(session_id: str, user_text: str) -> str:
                                         text = getattr(content_item, "text", "")
                                         if text and text.strip():
                                             final_text = text.strip()
-                                            print(f"✅ [Voice] Extracted text from continued response")
+                                            print(f"✅ [Voice] Extracted text from continued response message")
                                             break
                                 if final_text:
                                     break
-                except Exception as e:
-                    print(f"❌ [Voice] Error continuing incomplete response: {e}")
+                        
+                        # If we got a final response, break
+                        if final_text:
+                            final_response_obj = continued_response  # Track final response for tool call counting
+                            break
+                        
+                        # Update current response for next iteration
+                        current_response = continued_response
+                        final_response_obj = continued_response  # Track final response for tool call counting
+                        
+                        # If still incomplete and we haven't reached max attempts or tool call limit, continue
+                        if continued_status == 'incomplete' and continuation_attempt < max_continuations - 1:
+                            if total_tool_calls < VOICE_MAX_TOOL_CALLS:
+                                print(f"🔄 [Voice] Continued response also incomplete, will try again...")
+                                continue
+                            else:
+                                print(f"⚠️  [Voice] Cannot continue: tool call limit reached")
+                                if not final_text:
+                                    final_text = "I've reached the maximum number of steps for this request. Please try asking a simpler question or break it into smaller parts."
+                                break
+                        elif continued_status == 'completed':
+                            # Response completed but no text extracted - might be an issue
+                            print(f"⚠️  [Voice] Continued response completed but no text found")
+                            break
+                        else:
+                            # Unknown status or max attempts reached
+                            break
+                            
+                    except Exception as e:
+                        print(f"❌ [Voice] Error continuing incomplete response (attempt {continuation_attempt + 1}): {e}")
+                        import traceback
+                        traceback.print_exc()
+                        break
             
             # If still no text, provide a helpful fallback
             if not final_text:
@@ -843,6 +1084,11 @@ def generate_voice_response(session_id: str, user_text: str) -> str:
             print(f"⚠️  [Voice] Error logging outputs: {e}")
             import traceback
             traceback.print_exc()
+        
+        # Count total tool calls used (from final response)
+        total_tool_calls_used = count_tool_calls(final_response_obj)
+        if total_tool_calls_used > 0:
+            print(f"📊 [Voice] Total tool calls used: {total_tool_calls_used}/{VOICE_MAX_TOOL_CALLS}")
         
         print(f"")
         print(f"{'='*80}")
