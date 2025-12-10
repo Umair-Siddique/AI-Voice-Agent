@@ -19,7 +19,7 @@ openai_client = OpenAI(api_key=Config.OPENAI_API_KEY)
 # Remote MCP server configuration (FastMCP over SSE).
 # These values are used to register the MCP server as a tool with the
 # OpenAI Responses API so the model can call tools directly.
-SIMPLYBOOK_MCP_URL = os.getenv("SIMPLYBOOK_MCP_URL", "https://simplybook-mcp-server.onrender.com/sse")
+SIMPLYBOOK_MCP_URL = os.getenv("SIMPLYBOOK_MCP_URL", "https://simplybook-mcp-server-q8v5.onrender.com/sse")
 SIMPLYBOOK_MCP_LABEL = os.getenv("SIMPLYBOOK_MCP_LABEL", "simplybook")
 # Optional: JSON object for headers to include when calling the MCP server
 # e.g. {"Authorization": "Bearer <token>"}
