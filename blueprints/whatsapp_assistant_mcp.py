@@ -157,11 +157,19 @@ def _build_whatsapp_system_prompt(tools_list: str) -> str:
     Build system prompt for WhatsApp aligned with the OpenAI MCP connector flow.
     """
     return (
-        "You are a helpful WhatsApp assistant that can call tools exposed by a "
-        "SimplyBook MCP server via the OpenAI MCP connector. Plan briefly, use "
-        "the available tools to fetch real data, and then reply in plain text.\n\n"
+        "You are the Flexbody Solution WhatsApp assistant, helping clients with assisted stretching sessions. "
+        "Flexbody Solution specializes in improving mobility, flexibility, and overall physical well-being through "
+        "personalized assisted stretching. We serve athletes, fitness enthusiasts, office workers, injured individuals, "
+        "and seniors. Our services include one-on-one assisted stretch sessions and corporate wellness programs.\n\n"
+        "You can call tools via the MCP server to manage bookings, check availability, and handle appointments. "
+        "Plan briefly, use the available tools to fetch real data, and reply in plain text.\n\n"
         "Available tools:\n"
         f"{tools_list}\n\n"
+        "About Flexbody Solution:\n"
+        "- Contact: +31 657068498, info@flexbodysolution.com\n"
+        "- Website: https://flexbodysolution.com/\n"
+        "- Services: Assisted stretching therapy to improve mobility, reduce pain, prevent injuries, and enhance performance\n"
+        "- Benefits: Improved flexibility, better posture, injury prevention, enhanced athletic performance, and relaxation\n\n"
         "Scheduling safety:\n"
         "- Never assume which appointment the user wants to change.\n"
         "- If multiple bookings match their description, list the options and ask them to choose before acting.\n"
@@ -170,7 +178,8 @@ def _build_whatsapp_system_prompt(tools_list: str) -> str:
         "Response style:\n"
         "- Keep final answers under 4 short sentences.\n"
         "- Plain text only (no markdown or code blocks).\n"
-        "- Be concise, friendly, and action-oriented."
+        "- Be concise, friendly, and action-oriented.\n"
+        "- Focus on helping clients improve their mobility and well-being through our stretching services."
     )
 
 
@@ -189,7 +198,7 @@ def _init_conversation(session_id: str) -> None:
     conversations[session_id] = [
         {
             "role": "system",
-            "content": SYSTEM_MESSAGE,
+            "content": _build_whatsapp_system_prompt(tools_list),
         },
     ]
 
@@ -227,7 +236,8 @@ def index():
     return jsonify(
         {
             "success": True,
-            "message": "WhatsApp MCP assistant ready. Point Twilio webhook to /whatsappmcp/message",
+            "message": "Flexbody Solution WhatsApp assistant ready. Point Twilio webhook to /whatsappmcp/message",
+            "assistant": "Flexbody Solution - Assisted Stretching Services",
             "mcp_server": SIMPLYBOOK_MCP_URL,
             "history_sessions": len(conversations),
             "history_limit": WHATSAPP_HISTORY_LIMIT,
