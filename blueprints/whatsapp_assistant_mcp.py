@@ -189,7 +189,7 @@ def _init_conversation(session_id: str) -> None:
     conversations[session_id] = [
         {
             "role": "system",
-            "content": _build_whatsapp_system_prompt(tools_list),
+            "content": SYSTEM_MESSAGE,
         },
     ]
 
