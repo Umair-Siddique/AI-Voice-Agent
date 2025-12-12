@@ -1,7 +1,7 @@
 from flask import Flask
 from config import Config
 
-from extensions import init_openai
+from extensions import init_openai, init_supabase
 from blueprints.voice_assistant import voice_assistant_bp
 from blueprints.sms_assistant import sms_assistant_bp
 from blueprints.whatsapp_assistant import whatsapp_assistant_bp
@@ -30,6 +30,7 @@ def create_app():
 
     # Initialize extensions
     init_openai(app)
+    init_supabase(app)
 
     # Register blueprints
     app.register_blueprint(voice_assistant_bp, url_prefix="/voice")

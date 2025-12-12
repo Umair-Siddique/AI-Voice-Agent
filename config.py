@@ -14,4 +14,6 @@ class Config:
     STT_MODEL = os.getenv("STT_MODEL", "gpt-4o-mini-transcribe")
     TTS_MODEL = os.getenv("TTS_MODEL", "gpt-4o-mini-tts")
     RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
+    SUPABASE_SECRET_KEY=os.getenv("SUPABASE_SECRET_KEY")
+    SUPABASE_URL=os.getenv("SUPABASE_URL")
     CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL")

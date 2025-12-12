@@ -10,5 +10,6 @@ gevent
 fastmcp
 requests
 httpx
+supabase
 
 celery[redis]

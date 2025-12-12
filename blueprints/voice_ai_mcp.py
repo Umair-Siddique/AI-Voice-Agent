@@ -16,6 +16,17 @@ from openai import OpenAI
 from fastmcp import Client as FastMCPClient
 from config import Config
 from utils import SYSTEM_MESSAGE
+from db_helpers import (
+    create_conversation_async, 
+    end_conversation_async, 
+    save_message_async,
+    get_conversation_id,
+    set_conversation_metadata,
+    increment_message_count,
+    cleanup_session_metadata,
+    get_user_conversations,
+    get_conversation_messages
+)
 
 voice_mcp_bp = Blueprint("voice_mcp", __name__)
 
@@ -411,6 +422,51 @@ def connect_status():
     return Response('<?xml version="1.0" encoding="UTF-8"?><Response></Response>', mimetype='text/xml')
 
 
+@voice_mcp_bp.route("/conversations/<phone_number>", methods=["GET"])
+def get_user_conversation_history(phone_number: str):
+    """
+    Get conversation history for a specific phone number.
+    Optional query parameters:
+    - limit: number of conversations to return (default: 10)
+    """
+    try:
+        limit = min(int(request.args.get("limit", 10)), 50)  # Cap at 50
+        conversations = get_user_conversations(phone_number, limit)
+        
+        return jsonify({
+            "success": True,
+            "phone_number": phone_number,
+            "conversations": conversations,
+            "count": len(conversations)
+        })
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+@voice_mcp_bp.route("/conversations/<conversation_id>/messages", methods=["GET"])
+def get_conversation_message_history(conversation_id: str):
+    """
+    Get all messages for a specific conversation.
+    """
+    try:
+        messages = get_conversation_messages(conversation_id)
+        
+        return jsonify({
+            "success": True,
+            "conversation_id": conversation_id,
+            "messages": messages,
+            "count": len(messages)
+        })
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
 def register_websocket_routes(sock, app):
     """
     Register WebSocket routes for Twilio ConversationRelay.
@@ -473,6 +529,16 @@ def register_websocket_routes(sock, app):
                         # Initialize prompt buffer state
                         prompt_buffers[session_id] = {"buffer": "", "last_final": "", "last_received": time.time()}
                         
+                        # Create conversation record in database (async, non-blocking)
+                        # This will automatically set the conversation metadata when complete
+                        create_conversation_async(
+                            session_id=session_id,
+                            call_sid=call_sid,
+                            user_phone=from_number or "unknown",
+                            twilio_number=to_number or "unknown",
+                            call_direction=direction or "inbound"
+                        )
+                        
                         print(f"[WebSocket] Session initialized for {session_id}")
                         
                         # Twilio will play the welcomeGreeting automatically
@@ -502,6 +568,17 @@ def register_websocket_routes(sock, app):
                                 {"role": "system", "content": "Be concise and conversational. Keep answers brief (2-3 sentences max)."}
                             ]
                             prompt_buffers[session_id] = {"buffer": "", "last_final": "", "last_received": time.time()}
+                            
+                            # Create conversation record for fallback session (async, non-blocking)
+                            # This will automatically set the conversation metadata when complete
+                            create_conversation_async(
+                                session_id=session_id,
+                                call_sid=call_sid or "unknown",
+                                user_phone="unknown",
+                                twilio_number="unknown",
+                                call_direction="inbound"
+                            )
+                            
                             print(f"[WebSocket] Created new session: {session_id}")
                         
                         # Strip and clean the user text before processing
@@ -552,6 +629,17 @@ def register_websocket_routes(sock, app):
 
                         print(f"[WebSocket] Processing complete question: '{final_text}'")
                         
+                        # Save user message to database (async, non-blocking)
+                        conversation_id = get_conversation_id(session_id)
+                        if conversation_id:
+                            message_order = increment_message_count(session_id)
+                            save_message_async(
+                                conversation_id=conversation_id,
+                                role="user",
+                                content=final_text,
+                                message_order=message_order
+                            )
+                        
                         # Mark the time we are processing to avoid immediate follow-up fragments
                         buf_state["last_final_time"] = now
 
@@ -582,6 +670,17 @@ def register_websocket_routes(sock, app):
                         buf_state["buffer"] = ""
                         
                         print(f"[WebSocket] Generated AI response: {ai_response}")
+                        
+                        # Save AI response to database (async, non-blocking)
+                        conversation_id = get_conversation_id(session_id)
+                        if conversation_id:
+                            message_order = increment_message_count(session_id)
+                            save_message_async(
+                                conversation_id=conversation_id,
+                                role="assistant",
+                                content=ai_response,
+                                message_order=message_order
+                            )
                         
                         # Send final response back to Twilio for TTS
                         # Format: https://www.twilio.com/docs/voice/conversationrelay/websocket-messages#text-tokens-message
@@ -633,11 +732,20 @@ def register_websocket_routes(sock, app):
         
         finally:
             # Clean up session on disconnect
-            if session_id and session_id in conversation_sessions:
-                del conversation_sessions[session_id]
-                print(f"[WebSocket] Cleaned up session {session_id}")
-            if session_id and session_id in prompt_buffers:
-                del prompt_buffers[session_id]
+            if session_id:
+                # End conversation in database (async, non-blocking)
+                end_conversation_async(session_id)
+                
+                # Clean up session data
+                if session_id in conversation_sessions:
+                    del conversation_sessions[session_id]
+                    print(f"[WebSocket] Cleaned up session {session_id}")
+                if session_id in prompt_buffers:
+                    del prompt_buffers[session_id]
+                
+                # Clean up conversation metadata
+                cleanup_session_metadata(session_id)
+                
             print("[WebSocket] Connection closed")
     
     print("✅ WebSocket routes registered for Twilio ConversationRelay")
