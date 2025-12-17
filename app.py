@@ -40,6 +40,11 @@ def create_app():
     app.register_blueprint(mcp_bp, url_prefix="/mcp")
     app.register_blueprint(voice_mcp_bp,url_prefix="/voicemcp")
 
+
+
+
+    
+
     
     # Register WebSocket routes for voice_mcp
     from blueprints.voice_ai_mcp import register_websocket_routes as register_voice_mcp_websocket_routes
