@@ -4,7 +4,7 @@ from config import Config
 from extensions import init_openai, init_supabase
 
 from blueprints.sms_assistant import sms_assistant_bp
-from blueprints.whatsapp_assistant import whatsapp_assistant_bp
+
 from blueprints.mcp_server import mcp_bp
 from blueprints.voice_ai_mcp import voice_mcp_bp
 from blueprints.whatsapp_assistant_mcp import whatsapp_assistant_mcp_bp
@@ -35,7 +35,7 @@ def create_app():
     # Register blueprints
 
     app.register_blueprint(sms_assistant_bp, url_prefix="/sms")
-    app.register_blueprint(whatsapp_assistant_bp, url_prefix="/whatsapp")
+
     app.register_blueprint(whatsapp_assistant_mcp_bp, url_prefix="/whatsappmcp")
     app.register_blueprint(mcp_bp, url_prefix="/mcp")
     app.register_blueprint(voice_mcp_bp,url_prefix="/voicemcp")

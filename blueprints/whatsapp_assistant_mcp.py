@@ -107,49 +107,7 @@ async def _mcp_tools_brief(limit: int = 24) -> str:
     return "\n".join(lines) if lines else "- (no tools discovered)"
 
 
-def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
-    """
-    Extract the first JSON object from text and parse it (same as mcp_server.py).
-    Accepts plain JSON or fenced ```json blocks.
-    """
-    if not text:
-        return None
 
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-
-    fenced = re.search(r"```json\s*(\{[\s\S]*?\})\s*```", text, re.IGNORECASE)
-    if fenced:
-        try:
-            return json.loads(fenced.group(1))
-        except Exception:
-            pass
-
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        candidate = text[start : end + 1]
-        try:
-            return json.loads(candidate)
-        except Exception:
-            return None
-
-    return None
-
-
-async def _fetch_tool_schema(tool_name: str) -> Optional[Dict[str, Any]]:
-    """Fetch tool schema to help the model fix mistakes (same as mcp_server.py)."""
-    client = FastMCPClient(SIMPLYBOOK_MCP_URL.rstrip("/"))
-    async with client:
-        await asyncio.sleep(0.3)
-        tools = await client.list_tools()
-        for t in tools:
-            if getattr(t, "name", None) == tool_name:
-                schema = getattr(t, "inputSchema", None) or getattr(t, "schema", None)
-                return schema if isinstance(schema, dict) else None
-    return None
 
 
 def _build_whatsapp_system_prompt(tools_list: str) -> str:
@@ -210,6 +168,96 @@ def _truncate_for_whatsapp(text: str) -> str:
     return text[: WHATSAPP_MAX_MESSAGE_CHARS - 3] + "..."
 
 
+def _save_response_to_history(messages: List[Dict[str, Any]], response_obj: Any, final_text: str) -> None:
+    """
+    Save the complete assistant response to conversation history, including tool calls and results.
+    This ensures the LLM remembers what tools were called and their results in subsequent turns.
+    
+    According to OpenAI Responses API documentation, we need to preserve the full context
+    including any tool interactions so the model understands what actions were taken.
+    """
+    try:
+        # Extract conversation from the response object
+        conversation = getattr(response_obj, "conversation", None)
+        
+        if conversation:
+            # The conversation object contains the full message exchange including tool calls
+            # Add all new messages from this turn (tool calls, tool results, assistant response)
+            for msg in conversation:
+                msg_role = getattr(msg, "role", None)
+                
+                # Skip system and user messages as they're already in our history
+                if msg_role in ("system", "user"):
+                    continue
+                
+                # Add assistant and tool messages
+                if msg_role == "assistant":
+                    msg_content = getattr(msg, "content", [])
+                    # Save the assistant message (may include tool calls)
+                    if msg_content:
+                        messages.append({
+                            "role": "assistant",
+                            "content": _format_message_content(msg_content, final_text)
+                        })
+                
+                elif msg_role == "tool":
+                    # Save tool results
+                    tool_call_id = getattr(msg, "tool_call_id", "")
+                    content = getattr(msg, "content", "")
+                    if tool_call_id:
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call_id,
+                            "content": _safe_to_string(content)
+                        })
+            
+            # If we successfully added messages, return
+            if messages and messages[-1].get("role") in ("assistant", "tool"):
+                return
+        
+        # Fallback: just save the final text response
+        messages.append({"role": "assistant", "content": final_text})
+            
+    except Exception as exc:
+        print(f"⚠️  Warning: Failed to extract full response history: {exc}")
+        # Fallback to simple text response
+        messages.append({"role": "assistant", "content": final_text})
+
+
+def _format_message_content(content_items: List[Any], fallback_text: str) -> Any:
+    """Format message content, handling both simple text and structured content with tool calls."""
+    if not content_items:
+        return fallback_text
+    
+    # If there's only one text item, return it as a simple string
+    if len(content_items) == 1:
+        item = content_items[0]
+        item_type = getattr(item, "type", None)
+        if item_type == "text":
+            return getattr(item, "text", fallback_text)
+    
+    # Otherwise, return structured content (may include tool calls)
+    formatted_content = []
+    for item in content_items:
+        item_type = getattr(item, "type", None)
+        
+        if item_type == "text":
+            text = getattr(item, "text", "")
+            if text:
+                formatted_content.append({"type": "text", "text": text})
+        
+        elif item_type == "tool_call":
+            # Include tool call in structured format
+            formatted_content.append({
+                "type": "tool_call",
+                "id": getattr(item, "id", ""),
+                "name": getattr(item, "name", ""),
+                "arguments": getattr(item, "arguments", {})
+            })
+    
+    return formatted_content if formatted_content else fallback_text
+
+
 
 
 def _send_whatsapp_message(body: str, to_number: str):
@@ -230,19 +278,6 @@ def _send_whatsapp_message(body: str, to_number: str):
     return sids
 
 
-@whatsapp_assistant_mcp_bp.route("/", methods=["GET"])
-def index():
-    """Simple status endpoint."""
-    return jsonify(
-        {
-            "success": True,
-            "message": "Flexbody Solution WhatsApp assistant ready. Point Twilio webhook to /whatsappmcp/message",
-            "assistant": "Flexbody Solution - Assisted Stretching Services",
-            "mcp_server": SIMPLYBOOK_MCP_URL,
-            "history_sessions": len(conversations),
-            "history_limit": WHATSAPP_HISTORY_LIMIT,
-        }
-    )
 
 
 def _run_whatsapp_agent_step_loop(session_id: str, incoming_msg: str) -> str:
@@ -295,6 +330,7 @@ def _run_whatsapp_agent_step_loop(session_id: str, incoming_msg: str) -> str:
 
         return ""
 
+    last_response = None
     for step_num in range(WHATSAPP_AGENT_MAX_STEPS):
         try:
             print(f"🔄 Step {step_num + 1}/{WHATSAPP_AGENT_MAX_STEPS} for session {session_id} (MCP)")
@@ -308,6 +344,7 @@ def _run_whatsapp_agent_step_loop(session_id: str, incoming_msg: str) -> str:
             if previous_response_id:
                 response_kwargs["previous_response_id"] = previous_response_id
             response = openai_client.responses.create(**response_kwargs)
+            last_response = response  # Store the last response
         except Exception as exc:
             print(f"❌ OpenAI API error: {exc}")
             return "Sorry, I'm having trouble processing your request right now. Please try again."
@@ -334,15 +371,24 @@ def _run_whatsapp_agent_step_loop(session_id: str, incoming_msg: str) -> str:
     # Truncate for WhatsApp limits
     final_text = _truncate_for_whatsapp(final_text)
 
-    # Save final answer to conversation history
-    messages.append({"role": "assistant", "content": final_text})
+    # Save complete assistant response to conversation history including tool calls
+    # This is crucial for the LLM to remember what tools it called and their results
+    if last_response:
+        _save_response_to_history(messages, last_response, final_text)
+        print(f"💾 Saved response to history. Total messages: {len(messages)}")
+    else:
+        # Fallback if no response was captured
+        messages.append({"role": "assistant", "content": final_text})
+        print(f"⚠️  No response object captured, saved text only")
 
     # Trim history (system + last N dialogue turns)
     system_prompts = [m for m in messages if m["role"] == "system"]
-    dialogue = [m for m in messages if m["role"] in ("user", "assistant")]
+    dialogue = [m for m in messages if m["role"] in ("user", "assistant", "tool")]
     if len(dialogue) > WHATSAPP_HISTORY_LIMIT:
         dialogue = dialogue[-WHATSAPP_HISTORY_LIMIT :]
     conversations[session_id] = system_prompts + dialogue
+    
+    print(f"📝 Conversation history for {session_id}: {len(system_prompts)} system + {len(dialogue)} dialogue messages")
 
     return final_text
 
@@ -417,4 +463,61 @@ def clear_all_sessions():
     """Clear every WhatsApp conversation session."""
     conversations.clear()
     return jsonify({"success": True, "message": "All WhatsApp MCP sessions cleared"}), 200
+
+
+@whatsapp_assistant_mcp_bp.route("/inspect-session", methods=["POST"])
+def inspect_session():
+    """
+    Inspect conversation history for a WhatsApp session.
+    Useful for debugging conversation context and tool call history.
+    """
+    payload = request.get_json(silent=True) or {}
+    phone_number = payload.get("phone_number", "").strip()
+
+    if phone_number and not phone_number.startswith("whatsapp:"):
+        phone_number = f"whatsapp:{phone_number}"
+
+    if phone_number not in conversations:
+        return jsonify({"success": False, "message": "Session not found"}), 404
+
+    session_messages = conversations[phone_number]
+    
+    # Format messages for readability
+    formatted_messages = []
+    for msg in session_messages:
+        role = msg.get("role")
+        content = msg.get("content")
+        
+        # Handle structured content (with tool calls)
+        if isinstance(content, list):
+            formatted_content = []
+            for item in content:
+                if isinstance(item, dict):
+                    if item.get("type") == "text":
+                        formatted_content.append(f"Text: {item.get('text', '')[:100]}")
+                    elif item.get("type") == "tool_call":
+                        formatted_content.append(f"Tool Call: {item.get('name')} (ID: {item.get('id')})")
+                else:
+                    formatted_content.append(str(item)[:100])
+            content_preview = " | ".join(formatted_content)
+        elif isinstance(content, str):
+            content_preview = content[:200] + ("..." if len(content) > 200 else "")
+        else:
+            content_preview = str(content)[:200]
+        
+        formatted_messages.append({
+            "role": role,
+            "content_preview": content_preview,
+            "has_tool_calls": isinstance(content, list) and any(
+                isinstance(item, dict) and item.get("type") == "tool_call" 
+                for item in content
+            )
+        })
+    
+    return jsonify({
+        "success": True,
+        "session_id": phone_number,
+        "message_count": len(session_messages),
+        "messages": formatted_messages
+    }), 200
 
