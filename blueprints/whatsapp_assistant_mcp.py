@@ -28,7 +28,7 @@ SIMPLYBOOK_MCP_REQUIRE_APPROVAL = os.getenv("SIMPLYBOOK_MCP_REQUIRE_APPROVAL", "
 # WhatsApp specific tuning
 WHATSAPP_HISTORY_LIMIT = int(os.getenv("WHATSAPP_HISTORY_LIMIT", "12"))  # user+assistant turns to keep
 WHATSAPP_MAX_MESSAGE_CHARS = int(os.getenv("WHATSAPP_MAX_MESSAGE_CHARS", "1500"))  # Twilio limit 1600
-WHATSAPP_AGENT_MODEL = os.getenv("WHATSAPP_AGENT_MODEL", "gpt-5")
+WHATSAPP_AGENT_MODEL = os.getenv("WHATSAPP_AGENT_MODEL", "gpt-5.2")
 WHATSAPP_AGENT_MAX_STEPS = int(os.getenv("WHATSAPP_AGENT_MAX_STEPS", "15"))  # Max ReAct loop iterations
 WHATSAPP_MAX_OUTPUT_TOKENS = int(os.getenv("WHATSAPP_MAX_OUTPUT_TOKENS", "1200"))
 
@@ -140,13 +140,14 @@ def _build_whatsapp_system_prompt(tools_list: str) -> str:
         "   - For select/dropdown fields, present the available options naturally\n"
         "   - Never mention technical field IDs or the phrase 'intake forms' to users\n"
         "   - Frame questions based on the field name (e.g., 'Health Conditions' → 'Do you have any health conditions?')\n"
-        "5. Once you have ALL required information, call create_booking with:\n"
-        "   - All standard booking parameters (service_id, provider_id, client_id, start_datetime, etc.)\n"
-        "   - additional_fields array formatted as:\n"
-        "     [{\"field\": \"field_id_from_get_additional_fields\", \"value\": \"user_provided_value\"}, ...]\n"
-        "6. NEVER create a booking without first calling get_additional_fields\n"
-        "7. NEVER skip required additional_fields - the booking WILL fail with a 400 error\n"
-        "8. If get_additional_fields returns no required fields, you can proceed without additional_fields parameter\n\n"
+         "5. Once you have ALL required information, present the complete booking details (date, time, service) and ask 'Should I confirm this booking for you (Mentioning the details provided by user)?' - wait for user confirmation\n"
+         "6. Only after user confirms, call create_booking with:\n"
+         "   - All standard booking parameters (service_id, provider_id, client_id, start_datetime, etc.)\n"
+         "   - additional_fields array formatted as:\n"
+         "     [{\"field\": \"field_id_from_get_additional_fields\", \"value\": \"user_provided_value\"}, ...]\n"
+         "7. NEVER create a booking without first calling get_additional_fields\n"
+         "8. NEVER skip required additional_fields - the booking WILL fail with a 400 error\n"
+         "9. If get_additional_fields returns no required fields, you can proceed without additional_fields parameter\n\n"
         
         "Example conversation flow:\n"
         "User: 'I want to book a stretching session tomorrow at 3pm'\n"
