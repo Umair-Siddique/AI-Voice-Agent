@@ -687,10 +687,60 @@ def register_websocket_routes(sock, app):
                         # Mark the time we are processing to avoid immediate follow-up fragments
                         buf_state["last_final_time"] = now
 
+                        # Fetch previous conversation context (last 5 conversations = 10 messages)
+                        previous_conversations = []
+                        try:
+                            # Get user's phone number from conversation metadata
+                            conversation_id = get_conversation_id(session_id)
+                            if conversation_id:
+                                # Get all conversations for this user
+                                user_phone = None
+                                all_conversations = get_user_conversations("unknown", limit=50)  # We'll filter properly
+                                
+                                # Find current conversation to get phone number
+                                for conv in all_conversations:
+                                    if conv.get("conversation_id") == conversation_id:
+                                        user_phone = conv.get("user_phone")
+                                        break
+                                
+                                if user_phone:
+                                    print(f"📞 [WebSocket] Fetching previous conversations for {user_phone}")
+                                    
+                                    # Get user's recent conversations (excluding current one)
+                                    user_conversations = get_user_conversations(user_phone, limit=10)
+                                    
+                                    # Collect messages from previous conversations (last 10 messages)
+                                    message_count = 0
+                                    for conv in user_conversations:
+                                        if conv.get("conversation_id") == conversation_id:
+                                            continue  # Skip current conversation
+                                        
+                                        conv_messages = get_conversation_messages(conv.get("conversation_id", ""))
+                                        for msg in reversed(conv_messages):  # Get most recent first
+                                            if message_count >= 10:
+                                                break
+                                            if msg.get("role") in ("user", "assistant"):
+                                                previous_conversations.insert(0, {
+                                                    "role": msg.get("role"),
+                                                    "content": msg.get("content", "")
+                                                })
+                                                message_count += 1
+                                        
+                                        if message_count >= 10:
+                                            break
+                                    
+                                    if previous_conversations:
+                                        print(f"✅ [WebSocket] Loaded {len(previous_conversations)} previous messages for context")
+                                    else:
+                                        print(f"ℹ️  [WebSocket] No previous conversations found")
+                        except Exception as e:
+                            print(f"⚠️  [WebSocket] Error loading previous conversations: {e}")
+                            previous_conversations = []
+
                         # Check if tools are needed before generating response
                         # Get current conversation history (without the new user message yet)
                         current_history = conversation_sessions.get(session_id, [])
-                        needs_tools = _check_if_tools_needed(final_text, current_history)
+                        needs_tools = _check_if_tools_needed(final_text, current_history, previous_conversations)
                         
                         # If tools are needed, send immediate acknowledgment
                         if needs_tools:
@@ -707,8 +757,8 @@ def register_websocket_routes(sock, app):
                             ws.send(json.dumps(ack_message))
                             print(f"[WebSocket] Sent immediate acknowledgment to Twilio")
 
-                        # Generate AI response (this will include tool calls if needed)
-                        ai_response = generate_voice_response(session_id, final_text)
+                        # Generate AI response with previous conversation context
+                        ai_response = generate_voice_response(session_id, final_text, previous_conversations)
                         buf_state["last_final"] = final_text
                         buf_state["last_final_time"] = time.time()
                         buf_state["buffer"] = ""
@@ -795,25 +845,48 @@ def register_websocket_routes(sock, app):
     print("✅ WebSocket routes registered for Twilio ConversationRelay")
 
 
-def _check_if_tools_needed(user_text: str, conversation_history: List[Dict[str, str]]) -> bool:
+def _check_if_tools_needed(user_text: str, conversation_history: List[Dict[str, str]], previous_conversations: List[Dict[str, str]] = None) -> bool:
     """
     Analyze the user query using OpenAI to determine if SimplyBook MCP tools are needed.
-    Uses recent conversation context to avoid asking for time when the user is just chatting.
+    Uses recent conversation context AND previous conversations to better understand user intent.
     Returns True if tools are likely needed, False otherwise.
+    
+    Args:
+        user_text: The current user query
+        conversation_history: Current session conversation history
+        previous_conversations: Last 5 conversations (10 messages) from previous calls
     """
     if not Config.OPENAI_API_KEY:
         return False
     
     client = OpenAI(api_key=Config.OPENAI_API_KEY)
 
-    # Include a short slice of recent conversation so the model can understand context.
-    # Limit total characters to keep the prompt compact for the fast model.
+    # Build conversation context from both current and previous conversations
+    history_lines: List[str] = []
+    total_chars = 0
+    
+    # First, add previous conversations context if available
+    if previous_conversations:
+        history_lines.append("=== Previous Conversations ===")
+        for msg in previous_conversations:
+            role = msg.get("role", "unknown")
+            content = (msg.get("content", "") or "").strip()
+            if not content:
+                continue
+            line = f"{role}: {content}"
+            total_chars += len(line)
+            history_lines.append(line)
+            if total_chars >= 800:  # Reserve space for current conversation
+                break
+    
+    # Then add current session conversation
+    if history_lines:
+        history_lines.append("\n=== Current Session ===")
+    
     recent_msgs = [
         m for m in conversation_history[-8:]  # last ~4 turns (user + assistant)
         if m.get("role") in ("user", "assistant")
     ]
-    history_lines: List[str] = []
-    total_chars = 0
     for msg in recent_msgs:
         role = msg.get("role", "unknown")
         content = (msg.get("content", "") or "").strip()
@@ -824,24 +897,37 @@ def _check_if_tools_needed(user_text: str, conversation_history: List[Dict[str, 
         history_lines.append(line)
         if total_chars >= 1500:  # soft cap to avoid long prompts
             break
+    
     history_block = "\n".join(history_lines) if history_lines else "(no prior turns)"
     
-    # Build a focused analysis prompt
+    # Build a focused analysis prompt with full conversation context
     analysis_prompt = (
         "Analyze the following user query and determine if it requires accessing SimplyBook booking system tools.\n\n"
-        "Conversation so far:\n"
+        "Use the conversation history (both previous and current) to understand context and user intent.\n\n"
+        "Conversation history:\n"
         f"{history_block}\n\n"
-        "SimplyBook tools are needed for:\n"
-        "- Getting services list (get_services)\n"
-        "- Checking availability (get_available_slots)\n"
-        "- Getting providers (get_providers)\n"
-        "- Creating bookings (create_booking)\n"
-        "- Managing clients (get_clients_list, create_client)\n"
-        "- Updating existing appointments (rescheduling) or cancelling bookings\n"
-        "- Any query about appointments, bookings, schedules, availability, services, or providers\n\n"
-        "Simple conversational queries that don't need booking system data do NOT require tools.\n\n"
-        "User query: " + user_text + "\n\n"
-        "Respond with ONLY 'YES' if tools are needed, or 'NO' if not needed. No other text."
+        "Available SimplyBook MCP tools:\n"
+        "- get_services: Get list of available services\n"
+        "- get_available_slots: Check availability for booking\n"
+        "- get_providers: Get list of service providers\n"
+        "- create_booking: Create new appointments\n"
+        "- edit_booking: Update/reschedule appointments\n"
+        "- cancel_booking: Cancel appointments\n"
+        "- get_booking_list: Get user's bookings\n"
+        "- get_clients_list: Search/manage clients\n"
+        "- create_client: Create new client\n"
+        "- get_additional_fields: Get required booking fields\n\n"
+        "Tools are needed when the user wants to:\n"
+        "- Book, reschedule, or cancel appointments\n"
+        "- Check availability or service information\n"
+        "- View or manage their bookings\n"
+        "- Any action requiring real-time booking system data\n\n"
+        "Tools are NOT needed for:\n"
+        "- General conversation or greetings\n"
+        "- Questions about the business (use system knowledge)\n"
+        "- Follow-up responses that don't require new data\n\n"
+        "Current user query: " + user_text + "\n\n"
+        "Based on the full conversation context and current query, respond with ONLY 'YES' if tools are needed, or 'NO' if not needed. No other text."
     )
     
     try:
@@ -867,12 +953,17 @@ def _check_if_tools_needed(user_text: str, conversation_history: List[Dict[str, 
         return True
 
 
-def generate_voice_response(session_id: str, user_text: str) -> str:
+def generate_voice_response(session_id: str, user_text: str, previous_conversations: List[Dict[str, str]] = None) -> str:
     """
     Generate an AI response for voice conversation using OpenAI's official MCP implementation.
     Following: https://platform.openai.com/docs/guides/tools-connectors-mcp
     The Responses API handles MCP tool calling automatically when tools are provided.
     Optimized for voice: brief responses, conversational tone.
+    
+    Args:
+        session_id: Current session ID
+        user_text: User's input text
+        previous_conversations: Last 5 conversations (10 messages) from previous calls for context
     """
     if not Config.OPENAI_API_KEY:
         return "Configuration error: OpenAI API key is not set."
@@ -989,6 +1080,21 @@ def generate_voice_response(session_id: str, user_text: str) -> str:
     "- When asking for additional information, be natural and conversational, not robotic"
     )
     conversation_sessions[session_id] = [{"role": "system", "content": system_prompt}]
+    
+    # Add previous conversation context if available
+    if previous_conversations:
+        print(f"📚 [Voice] Including context from {len(previous_conversations)} previous messages")
+        
+        # Add previous conversations as context (but not as part of current session)
+        context_message = "=== Previous Conversation Context ===\n"
+        for msg in previous_conversations:
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+            context_message += f"{role}: {content}\n"
+        context_message += "\n=== Current Conversation ===\n"
+        context_message += "Use the above context to understand the user better and provide more contextual responses. Reference previous conversations when relevant."
+        
+        conversation_sessions[session_id].append({"role": "system", "content": context_message})
     
     # Append user message
     print(f"")
