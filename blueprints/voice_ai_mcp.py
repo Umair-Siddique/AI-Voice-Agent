@@ -279,6 +279,50 @@ def _find_first_json_block(text: str) -> Optional[str]:
     return None
 
 
+def _sanitize_for_voice(text: str) -> str:
+    """
+    Remove special characters / Markdown artifacts that sound bad in TTS,
+    while preserving the underlying text as much as possible.
+    """
+    if not text:
+        return ""
+
+    s = str(text)
+
+    # Remove ONLY the fence marker lines, keep code content.
+    # e.g. ```json ... ``` -> ... (no backticks spoken)
+    s = re.sub(r"(?m)^\s*```[a-zA-Z0-9_-]*\s*$", "", s)
+
+    # Replace markdown links: [label](url) -> label
+    s = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1", s)
+
+    # Replace bare autolinks: <https://...> -> https://...
+    s = re.sub(r"<(https?://[^>]+)>", r"\1", s)
+
+    # Strip headings: ### Title -> Title
+    s = re.sub(r"(?m)^\s{0,3}#{1,6}\s+", "", s)
+
+    # Strip blockquote markers
+    s = re.sub(r"(?m)^\s{0,3}>\s?", "", s)
+
+    # Strip common list markers at line starts: "- ", "* ", "1. "
+    s = re.sub(r"(?m)^\s*[-*+]\s+", "", s)
+    s = re.sub(r"(?m)^\s*\d+\.\s+", "", s)
+
+    # Remove emphasis/strikethrough markers and inline code ticks.
+    s = s.replace("**", "")
+    s = s.replace("__", "")
+    s = s.replace("~~", "")
+    s = s.replace("`", "")
+    s = s.replace("*", "")
+    # Keep underscores (can be meaningful in emails/usernames); remove other common table separators.
+    s = s.replace("|", " ")
+
+    # Collapse whitespace/newlines
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
 async def _fetch_tool_schema(tool_name: str) -> Optional[Dict[str, Any]]:
     """
     Return the input schema for a given tool name by querying the MCP server.
@@ -1213,6 +1257,11 @@ def generate_voice_response(session_id: str, user_text: str) -> str:
             if not final_text:
                 final_text = "I'm having trouble completing that request. Could you try rephrasing your question?"
         
+        # Final cleanup for TTS: remove special chars/markdown artifacts without changing meaning
+        sanitized_text = _sanitize_for_voice(final_text)
+        if sanitized_text:
+            final_text = sanitized_text
+
         response_status = getattr(response, 'status', 'unknown')
         print(f"🤖 [Voice] Response received (status: {response_status})")
         print(f"")
