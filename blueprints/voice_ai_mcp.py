@@ -687,15 +687,30 @@ def register_websocket_routes(sock, app):
                         # Mark the time we are processing to avoid immediate follow-up fragments
                         buf_state["last_final_time"] = now
 
-                        # Fetch previous conversation context (last 5 conversations = 10 messages)
-                        previous_conversations = []
+                        # Fetch conversation context (current session + last 5 previous conversations)
+                        # This includes BOTH the current conversation messages AND previous call history
+                        conversation_context = []
                         try:
-                            # Get user's phone number from conversation metadata
+                            # Get current conversation ID
                             conversation_id = get_conversation_id(session_id)
                             if conversation_id:
-                                # Get all conversations for this user
+                                # FIRST: Get messages from CURRENT conversation (already saved to DB)
+                                print(f"📖 [WebSocket] Fetching current conversation messages from database")
+                                current_conv_messages = get_conversation_messages(conversation_id)
+                                current_messages = []
+                                for msg in current_conv_messages:
+                                    if msg.get("role") in ("user", "assistant"):
+                                        current_messages.append({
+                                            "role": msg.get("role"),
+                                            "content": msg.get("content", "")
+                                        })
+                                
+                                if current_messages:
+                                    print(f"✅ [WebSocket] Loaded {len(current_messages)} messages from current conversation")
+                                
+                                # SECOND: Get previous conversations for context
                                 user_phone = None
-                                all_conversations = get_user_conversations("unknown", limit=50)  # We'll filter properly
+                                all_conversations = get_user_conversations("unknown", limit=50)
                                 
                                 # Find current conversation to get phone number
                                 for conv in all_conversations:
@@ -703,6 +718,7 @@ def register_websocket_routes(sock, app):
                                         user_phone = conv.get("user_phone")
                                         break
                                 
+                                previous_conversations = []
                                 if user_phone:
                                     print(f"📞 [WebSocket] Fetching previous conversations for {user_phone}")
                                     
@@ -730,17 +746,22 @@ def register_websocket_routes(sock, app):
                                             break
                                     
                                     if previous_conversations:
-                                        print(f"✅ [WebSocket] Loaded {len(previous_conversations)} previous messages for context")
-                                    else:
-                                        print(f"ℹ️  [WebSocket] No previous conversations found")
+                                        print(f"✅ [WebSocket] Loaded {len(previous_conversations)} messages from previous conversations")
+                                
+                                # Combine: previous conversations + current conversation messages
+                                conversation_context = previous_conversations + current_messages
+                                print(f"📚 [WebSocket] Total context: {len(conversation_context)} messages ({len(previous_conversations)} previous + {len(current_messages)} current)")
+                                
                         except Exception as e:
-                            print(f"⚠️  [WebSocket] Error loading previous conversations: {e}")
-                            previous_conversations = []
+                            print(f"⚠️  [WebSocket] Error loading conversation context: {e}")
+                            import traceback
+                            traceback.print_exc()
+                            conversation_context = []
 
                         # Check if tools are needed before generating response
                         # Get current conversation history (without the new user message yet)
                         current_history = conversation_sessions.get(session_id, [])
-                        needs_tools = _check_if_tools_needed(final_text, current_history, previous_conversations)
+                        needs_tools = _check_if_tools_needed(final_text, current_history, conversation_context)
                         
                         # If tools are needed, send immediate acknowledgment
                         if needs_tools:
@@ -757,8 +778,8 @@ def register_websocket_routes(sock, app):
                             ws.send(json.dumps(ack_message))
                             print(f"[WebSocket] Sent immediate acknowledgment to Twilio")
 
-                        # Generate AI response with previous conversation context
-                        ai_response = generate_voice_response(session_id, final_text, previous_conversations)
+                        # Generate AI response with full conversation context (previous + current)
+                        ai_response = generate_voice_response(session_id, final_text, conversation_context)
                         buf_state["last_final"] = final_text
                         buf_state["last_final_time"] = time.time()
                         buf_state["buffer"] = ""
@@ -845,30 +866,46 @@ def register_websocket_routes(sock, app):
     print("✅ WebSocket routes registered for Twilio ConversationRelay")
 
 
-def _check_if_tools_needed(user_text: str, conversation_history: List[Dict[str, str]], previous_conversations: List[Dict[str, str]] = None) -> bool:
+def _check_if_tools_needed(user_text: str, conversation_history: List[Dict[str, str]], conversation_context: List[Dict[str, str]] = None) -> bool:
     """
     Analyze the user query using OpenAI to determine if SimplyBook MCP tools are needed.
-    Uses recent conversation context AND previous conversations to better understand user intent.
+    Uses FULL conversation context (previous calls + current session) to better understand user intent.
     Returns True if tools are likely needed, False otherwise.
     
     Args:
         user_text: The current user query
-        conversation_history: Current session conversation history
-        previous_conversations: Last 5 conversations (10 messages) from previous calls
+        conversation_history: Current session conversation history (in-memory)
+        conversation_context: Full conversation context from DB (previous calls + current session messages)
     """
     if not Config.OPENAI_API_KEY:
         return False
     
     client = OpenAI(api_key=Config.OPENAI_API_KEY)
 
-    # Build conversation context from both current and previous conversations
+    # Build conversation context - use full context from DB if available
     history_lines: List[str] = []
     total_chars = 0
     
-    # First, add previous conversations context if available
-    if previous_conversations:
-        history_lines.append("=== Previous Conversations ===")
-        for msg in previous_conversations:
+    # Use the full conversation context from database (includes previous calls + current session)
+    if conversation_context:
+        for msg in conversation_context:
+            role = msg.get("role", "unknown")
+            content = (msg.get("content", "") or "").strip()
+            if not content or role not in ("user", "assistant"):
+                continue
+            line = f"{role}: {content}"
+            total_chars += len(line)
+            history_lines.append(line)
+            if total_chars >= 2000:  # Increased limit to include more context
+                break
+    
+    # Fallback to in-memory conversation history if no DB context
+    if not history_lines:
+        recent_msgs = [
+            m for m in conversation_history[-8:]
+            if m.get("role") in ("user", "assistant")
+        ]
+        for msg in recent_msgs:
             role = msg.get("role", "unknown")
             content = (msg.get("content", "") or "").strip()
             if not content:
@@ -876,27 +913,8 @@ def _check_if_tools_needed(user_text: str, conversation_history: List[Dict[str, 
             line = f"{role}: {content}"
             total_chars += len(line)
             history_lines.append(line)
-            if total_chars >= 800:  # Reserve space for current conversation
+            if total_chars >= 1500:
                 break
-    
-    # Then add current session conversation
-    if history_lines:
-        history_lines.append("\n=== Current Session ===")
-    
-    recent_msgs = [
-        m for m in conversation_history[-8:]  # last ~4 turns (user + assistant)
-        if m.get("role") in ("user", "assistant")
-    ]
-    for msg in recent_msgs:
-        role = msg.get("role", "unknown")
-        content = (msg.get("content", "") or "").strip()
-        if not content:
-            continue
-        line = f"{role}: {content}"
-        total_chars += len(line)
-        history_lines.append(line)
-        if total_chars >= 1500:  # soft cap to avoid long prompts
-            break
     
     history_block = "\n".join(history_lines) if history_lines else "(no prior turns)"
     
@@ -953,7 +971,7 @@ def _check_if_tools_needed(user_text: str, conversation_history: List[Dict[str, 
         return True
 
 
-def generate_voice_response(session_id: str, user_text: str, previous_conversations: List[Dict[str, str]] = None) -> str:
+def generate_voice_response(session_id: str, user_text: str, conversation_context: List[Dict[str, str]] = None) -> str:
     """
     Generate an AI response for voice conversation using OpenAI's official MCP implementation.
     Following: https://platform.openai.com/docs/guides/tools-connectors-mcp
@@ -963,7 +981,7 @@ def generate_voice_response(session_id: str, user_text: str, previous_conversati
     Args:
         session_id: Current session ID
         user_text: User's input text
-        previous_conversations: Last 5 conversations (10 messages) from previous calls for context
+        conversation_context: Full conversation context from DB (previous calls + current session messages)
     """
     if not Config.OPENAI_API_KEY:
         return "Configuration error: OpenAI API key is not set."
@@ -1081,22 +1099,26 @@ def generate_voice_response(session_id: str, user_text: str, previous_conversati
     )
     conversation_sessions[session_id] = [{"role": "system", "content": system_prompt}]
     
-    # Add previous conversation context if available
-    if previous_conversations:
-        print(f"📚 [Voice] Including context from {len(previous_conversations)} previous messages")
+    # Add conversation context if available (includes both previous calls AND current session from DB)
+    if conversation_context:
+        print(f"📚 [Voice] Including context from {len(conversation_context)} messages")
         
-        # Add previous conversations as context (but not as part of current session)
-        context_message = "=== Previous Conversation Context ===\n"
-        for msg in previous_conversations:
-            role = msg.get("role", "unknown")
+        # Reconstruct the full conversation history from the database
+        # This ensures we have ALL the context including:
+        # 1. Messages from previous phone calls
+        # 2. Messages from earlier in THIS call (already saved to DB)
+        for msg in conversation_context:
+            role = msg.get("role")
             content = msg.get("content", "")
-            context_message += f"{role}: {content}\n"
-        context_message += "\n=== Current Conversation ===\n"
-        context_message += "Use the above context to understand the user better and provide more contextual responses. Reference previous conversations when relevant."
+            if role in ("user", "assistant") and content:
+                conversation_sessions[session_id].append({
+                    "role": role,
+                    "content": content
+                })
         
-        conversation_sessions[session_id].append({"role": "system", "content": context_message})
+        print(f"✅ [Voice] Loaded full conversation history into session context")
     
-    # Append user message
+    # Append current user message
     print(f"")
     print(f"{'='*80}")
     print(f"👤 [Voice] User: {user_text}")
@@ -1105,6 +1127,13 @@ def generate_voice_response(session_id: str, user_text: str, previous_conversati
     
     conversation_sessions[session_id].append({"role": "user", "content": user_text})
     messages = conversation_sessions[session_id]
+    
+    # Debug: Print the conversation structure
+    print(f"📊 [Voice] Conversation has {len(messages)} messages:")
+    for idx, msg in enumerate(messages):
+        role = msg.get("role", "unknown")
+        content = msg.get("content", "")[:100]  # First 100 chars
+        print(f"   [{idx}] {role}: {content}...")
     
     client = OpenAI(api_key=Config.OPENAI_API_KEY)
     
@@ -1449,11 +1478,14 @@ def generate_voice_response(session_id: str, user_text: str, previous_conversati
         # Update conversation history with assistant's response
         conversation_sessions[session_id].append({"role": "assistant", "content": final_text})
         
-        # Prune history to keep conversation manageable
+        # Note: We don't need aggressive pruning anymore since we're loading
+        # full context from database on each turn. The database is the source of truth.
+        # We keep conversation_sessions mainly for the current API call.
+        # Light pruning only to prevent extreme memory usage in very long sessions.
         system_msgs = [m for m in conversation_sessions[session_id] if m.get("role") == "system"]
         convo = [m for m in conversation_sessions[session_id] if m.get("role") in ("user", "assistant")]
-        if len(convo) > 12:  # Keep last 6 exchanges (6 user + 6 assistant)
-            convo = convo[-12:]
+        if len(convo) > 40:  # Only prune if conversation gets very long (20 exchanges)
+            convo = convo[-40:]  # Keep last 20 exchanges
         conversation_sessions[session_id] = system_msgs + convo
         
         return final_text
