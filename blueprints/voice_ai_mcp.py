@@ -693,20 +693,30 @@ def register_websocket_routes(sock, app):
                         try:
                             # Get current conversation ID
                             conversation_id = get_conversation_id(session_id)
+                            print(f"🔍 [WebSocket] Current conversation_id: {conversation_id}")
+                            
                             if conversation_id:
                                 # FIRST: Get messages from CURRENT conversation (already saved to DB)
                                 print(f"📖 [WebSocket] Fetching current conversation messages from database")
                                 current_conv_messages = get_conversation_messages(conversation_id)
+                                print(f"🔍 [WebSocket] Raw messages from DB: {len(current_conv_messages) if current_conv_messages else 0}")
+                                
                                 current_messages = []
-                                for msg in current_conv_messages:
-                                    if msg.get("role") in ("user", "assistant"):
-                                        current_messages.append({
-                                            "role": msg.get("role"),
-                                            "content": msg.get("content", "")
-                                        })
+                                if current_conv_messages:
+                                    for msg in current_conv_messages:
+                                        role = msg.get("role")
+                                        content = msg.get("content", "")
+                                        if role in ("user", "assistant") and content:
+                                            current_messages.append({
+                                                "role": role,
+                                                "content": content
+                                            })
+                                            print(f"   ✓ Loaded {role}: {content[:60]}...")
                                 
                                 if current_messages:
                                     print(f"✅ [WebSocket] Loaded {len(current_messages)} messages from current conversation")
+                                else:
+                                    print(f"ℹ️  [WebSocket] No messages in current conversation yet")
                                 
                                 # SECOND: Get previous conversations for context
                                 user_phone = None
@@ -716,22 +726,27 @@ def register_websocket_routes(sock, app):
                                 for conv in all_conversations:
                                     if conv.get("conversation_id") == conversation_id:
                                         user_phone = conv.get("user_phone")
+                                        print(f"📞 [WebSocket] Found user_phone: {user_phone}")
                                         break
                                 
                                 previous_conversations = []
-                                if user_phone:
+                                if user_phone and user_phone != "unknown":
                                     print(f"📞 [WebSocket] Fetching previous conversations for {user_phone}")
                                     
                                     # Get user's recent conversations (excluding current one)
                                     user_conversations = get_user_conversations(user_phone, limit=10)
+                                    print(f"   Found {len(user_conversations)} total conversations for user")
                                     
                                     # Collect messages from previous conversations (last 10 messages)
                                     message_count = 0
                                     for conv in user_conversations:
-                                        if conv.get("conversation_id") == conversation_id:
+                                        conv_id = conv.get("conversation_id")
+                                        if conv_id == conversation_id:
+                                            print(f"   Skipping current conversation {conv_id}")
                                             continue  # Skip current conversation
                                         
-                                        conv_messages = get_conversation_messages(conv.get("conversation_id", ""))
+                                        print(f"   Loading messages from conversation {conv_id}")
+                                        conv_messages = get_conversation_messages(conv_id or "")
                                         for msg in reversed(conv_messages):  # Get most recent first
                                             if message_count >= 10:
                                                 break
@@ -747,10 +762,16 @@ def register_websocket_routes(sock, app):
                                     
                                     if previous_conversations:
                                         print(f"✅ [WebSocket] Loaded {len(previous_conversations)} messages from previous conversations")
+                                    else:
+                                        print(f"ℹ️  [WebSocket] No previous conversations found")
+                                else:
+                                    print(f"ℹ️  [WebSocket] No valid user_phone, skipping previous conversations")
                                 
                                 # Combine: previous conversations + current conversation messages
                                 conversation_context = previous_conversations + current_messages
                                 print(f"📚 [WebSocket] Total context: {len(conversation_context)} messages ({len(previous_conversations)} previous + {len(current_messages)} current)")
+                            else:
+                                print(f"⚠️  [WebSocket] No conversation_id found for session {session_id}")
                                 
                         except Exception as e:
                             print(f"⚠️  [WebSocket] Error loading conversation context: {e}")
@@ -986,14 +1007,13 @@ def generate_voice_response(session_id: str, user_text: str, conversation_contex
     if not Config.OPENAI_API_KEY:
         return "Configuration error: OpenAI API key is not set."
     
-    # Initialize conversation if new session
-    if session_id not in conversation_sessions:
-        print(f"")
-        print(f"{'='*80}")
-        print(f"🆕 [Voice] Initializing new session: {session_id}")
-        print(f"{'='*80}")
-        
-        # System message (same as WhatsApp assistant, optimized for voice)
+    # Build system prompt (always, for every turn)
+    print(f"")
+    print(f"{'='*80}")
+    print(f"👤 [Voice] User: {user_text}")
+    print(f"{'='*80}")
+    print(f"")
+    
     system_prompt = (
     "You are the Flexbody Solution assistant, helping clients with assisted stretching sessions. "
     "Flexbody Solution specializes in improving mobility, flexibility, and overall physical well-being through "
@@ -1097,36 +1117,34 @@ def generate_voice_response(session_id: str, user_text: str, conversation_contex
     "- Focus on helping clients improve their mobility and well-being through our stretching services\n"
     "- When asking for additional information, be natural and conversational, not robotic"
     )
-    conversation_sessions[session_id] = [{"role": "system", "content": system_prompt}]
+    
+    # ALWAYS rebuild conversation from scratch using database context
+    # This ensures we have the complete history on every turn
+    messages = [{"role": "system", "content": system_prompt}]
     
     # Add conversation context if available (includes both previous calls AND current session from DB)
-    if conversation_context:
-        print(f"📚 [Voice] Including context from {len(conversation_context)} messages")
+    if conversation_context and len(conversation_context) > 0:
+        print(f"📚 [Voice] Rebuilding conversation with {len(conversation_context)} messages from database")
         
-        # Reconstruct the full conversation history from the database
-        # This ensures we have ALL the context including:
-        # 1. Messages from previous phone calls
-        # 2. Messages from earlier in THIS call (already saved to DB)
+        # Add all previous messages from database
         for msg in conversation_context:
             role = msg.get("role")
             content = msg.get("content", "")
             if role in ("user", "assistant") and content:
-                conversation_sessions[session_id].append({
+                messages.append({
                     "role": role,
                     "content": content
                 })
         
-        print(f"✅ [Voice] Loaded full conversation history into session context")
+        print(f"✅ [Voice] Loaded full conversation history")
+    else:
+        print(f"ℹ️  [Voice] No previous conversation context available")
     
     # Append current user message
-    print(f"")
-    print(f"{'='*80}")
-    print(f"👤 [Voice] User: {user_text}")
-    print(f"{'='*80}")
-    print(f"")
+    messages.append({"role": "user", "content": user_text})
     
-    conversation_sessions[session_id].append({"role": "user", "content": user_text})
-    messages = conversation_sessions[session_id]
+    # Update the session storage for this turn (will be used for fallback/debugging)
+    conversation_sessions[session_id] = messages
     
     # Debug: Print the conversation structure
     print(f"📊 [Voice] Conversation has {len(messages)} messages:")
@@ -1475,18 +1493,19 @@ def generate_voice_response(session_id: str, user_text: str, conversation_contex
         print(f"{'='*80}")
         print(f"")
         
-        # Update conversation history with assistant's response
-        conversation_sessions[session_id].append({"role": "assistant", "content": final_text})
-        
-        # Note: We don't need aggressive pruning anymore since we're loading
-        # full context from database on each turn. The database is the source of truth.
-        # We keep conversation_sessions mainly for the current API call.
-        # Light pruning only to prevent extreme memory usage in very long sessions.
-        system_msgs = [m for m in conversation_sessions[session_id] if m.get("role") == "system"]
-        convo = [m for m in conversation_sessions[session_id] if m.get("role") in ("user", "assistant")]
-        if len(convo) > 40:  # Only prune if conversation gets very long (20 exchanges)
-            convo = convo[-40:]  # Keep last 20 exchanges
-        conversation_sessions[session_id] = system_msgs + convo
+        # Update in-memory conversation history with assistant's response
+        # Note: This is less important now since we reload from database on each turn
+        # The database is the source of truth, not the in-memory session
+        if session_id in conversation_sessions:
+            conversation_sessions[session_id].append({"role": "assistant", "content": final_text})
+            
+            # Light pruning only to prevent extreme memory usage in very long sessions
+            # (We reload from DB anyway, so this is just for memory management)
+            system_msgs = [m for m in conversation_sessions[session_id] if m.get("role") == "system"]
+            convo = [m for m in conversation_sessions[session_id] if m.get("role") in ("user", "assistant")]
+            if len(convo) > 50:  # Only prune if conversation gets very long
+                convo = convo[-50:]  # Keep last 25 exchanges
+            conversation_sessions[session_id] = system_msgs + convo
         
         return final_text
         
