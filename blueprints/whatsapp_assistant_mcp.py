@@ -276,6 +276,7 @@ def _build_whatsapp_system_prompt(tools_list: str) -> str:
         # ========== END CANCELLATION ==========
         
         "Scheduling safety:\n"
+        "- ALWAYS confirm personal details (name, email, or phone number) BEFORE creating, rescheduling, or canceling any booking\n"
         "- Never assume which appointment the user wants to change\n"
         "- If multiple bookings match, list options and ask user to choose\n"
         "- Always confirm booking details before making changes\n"
